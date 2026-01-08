@@ -3,7 +3,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telethon import TelegramClient
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # AstrBot 插件 API
@@ -84,7 +84,7 @@ class TelegramSummaryPlugin(Star):
         logger.info("开始初始化AI客户端...")
         logger.debug(f"AI客户端配置: Base URL={self.LLM_BASE_URL}, Model={self.LLM_MODEL}, API Key={'***' if self.LLM_API_KEY else '未设置'}")
         
-        self.client_llm = OpenAI(
+        self.client_llm = AsyncOpenAI(
             api_key=self.LLM_API_KEY, 
             base_url=self.LLM_BASE_URL
         )
@@ -218,7 +218,7 @@ class TelegramSummaryPlugin(Star):
             logger.info(f"所有指定频道消息抓取完成，共处理 {total_message_count} 条消息")
             return messages_by_channel
     
-    def analyze_with_ai(self, messages):
+    async def analyze_with_ai(self, messages):
         """调用 AI 进行汇总"""
         logger.info("开始调用AI进行消息汇总")
         
@@ -234,7 +234,7 @@ class TelegramSummaryPlugin(Star):
         
         try:
             start_time = datetime.now()
-            response = self.client_llm.chat.completions.create(
+            response = await self.client_llm.chat.completions.create(
                 model=self.LLM_MODEL,
                 messages=[
                     {"role": "system", "content": "你是一个专业的资讯摘要助手，擅长提取重点并保持客观。"},
@@ -283,7 +283,7 @@ class TelegramSummaryPlugin(Star):
             # 按频道分别生成和发送总结报告
             for channel, messages in messages_by_channel.items():
                 logger.info(f"开始处理频道 {channel} 的消息")
-                summary = self.analyze_with_ai(messages)
+                summary = await self.analyze_with_ai(messages)
                 # 获取频道名称用于报告标题
                 channel_name = channel.split('/')[-1]
                 await self.send_report(f"📋 **{channel_name} 频道周报汇总**\n\n{summary}")
@@ -402,7 +402,7 @@ class TelegramSummaryPlugin(Star):
             # 按频道分别生成和发送总结报告
             for channel, messages in messages_by_channel.items():
                 logger.info(f"开始处理频道 {channel} 的消息")
-                summary = self.analyze_with_ai(messages)
+                summary = await self.analyze_with_ai(messages)
                 # 获取频道名称用于报告标题
                 channel_name = channel.split('/')[-1]
                 yield event.plain_result(f"📋 **{channel_name} 频道周报汇总**\n\n{summary}")
