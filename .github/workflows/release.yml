@@ -36,8 +36,27 @@ jobs:
           VERSION=$(echo $GITHUB_REF | sed 's/refs\/tags\///')
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           
-          # Use awk to extract the changelog for the current version
-          CHANGELOG=$(awk '/^## \['"$VERSION"'\]/,/^## \[/ {print}' CHANGELOG.md | sed '/^## \[/d')
+          # Use Python script to extract the changelog for the current version
+          CHANGELOG=$(python -c "
+          import re
+          import sys
+          
+          with open('CHANGELOG.md', 'r', encoding='utf-8') as f:
+              content = f.read()
+          
+          version = '$VERSION'
+          # 匹配指定版本的变更日志
+          pattern = rf'## \[{version}\] - .+?\n(.*?)(?=## \[|$)'
+          match = re.search(pattern, content, re.DOTALL)
+          
+          if match:
+              changelog = match.group(1).strip()
+              print(changelog)
+          else:
+              print(f'No changelog found for version {version}')
+              sys.exit(1)
+          ")
+          
           echo "CHANGELOG<<EOF" >> $GITHUB_ENV
           echo "$CHANGELOG" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
