@@ -9,7 +9,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger # 使用 astrbot 提供的 logger 接口
 from astrbot.api import AstrBotConfig # 使用 astrbot 提供的配置接口
 
-@register("telegram_summary", "author", "一个 Telegram 频道消息汇总插件，每周一生成指定频道的消息汇总报告。", "1.0.0", "repo url")
+@register("telegram_summary", "Sakura520222", "一个 Telegram 频道消息汇总插件，每周一生成指定频道的消息汇总报告。", "1.0.1", "https://github.com/Sakura520222/astrbot_plugin_telegram_summary")
 class TelegramSummaryPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -19,7 +19,8 @@ class TelegramSummaryPlugin(Star):
         self.PROMPT_FILE = "prompt.txt"
         self.CONFIG_FILE = "config.json"
         self.RESTART_FLAG_FILE = ".restart_flag"
-        logger.debug(f"配置文件路径: 提示词文件={self.PROMPT_FILE}, 配置文件={self.CONFIG_FILE}")
+        self.LAST_SUMMARY_FILE = "last_summary_time.json"
+        logger.debug(f"配置文件路径: 提示词文件={self.PROMPT_FILE}, 配置文件={self.CONFIG_FILE}, 上次总结时间文件={self.LAST_SUMMARY_FILE}")
         
         # 默认提示词
         self.DEFAULT_PROMPT = "请总结以下 Telegram 消息，提取核心要点并列出重要消息的链接：\n\n"
@@ -51,6 +52,10 @@ class TelegramSummaryPlugin(Star):
         
         # 全局变量，用于跟踪正在设置提示词的用户
         self.setting_prompt_users = set()
+        
+        # 加载上次总结时间
+        self.last_summary_time = self.load_last_summary_time()
+        logger.info(f"已加载上次总结时间: {self.last_summary_time}")
         
         # 初始化调度器
         self.scheduler = AsyncIOScheduler()
@@ -118,31 +123,79 @@ class TelegramSummaryPlugin(Star):
         except Exception as e:
             logger.error(f"保存配置到文件 {self.CONFIG_FILE} 时出错: {type(e).__name__}: {e}")
     
+    def load_last_summary_time(self):
+        """从文件中读取上次总结时间，如果文件不存在则返回None"""
+        import json
+        logger.info(f"开始读取上次总结时间文件: {self.LAST_SUMMARY_FILE}")
+        try:
+            with open(self.LAST_SUMMARY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                last_time_str = data.get('last_summary_time')
+                if last_time_str:
+                    from datetime import datetime, timezone
+                    last_time = datetime.fromisoformat(last_time_str).replace(tzinfo=timezone.utc)
+                    logger.info(f"成功读取上次总结时间: {last_time}")
+                    return last_time
+                else:
+                    logger.warning(f"上次总结时间文件 {self.LAST_SUMMARY_FILE} 中没有有效的时间记录")
+                    return None
+        except FileNotFoundError:
+            logger.warning(f"上次总结时间文件 {self.LAST_SUMMARY_FILE} 不存在，将使用默认值")
+            return None
+        except json.JSONDecodeError as e:
+            logger.error(f"上次总结时间文件 {self.LAST_SUMMARY_FILE} 格式错误: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"读取上次总结时间文件 {self.LAST_SUMMARY_FILE} 时出错: {type(e).__name__}: {e}")
+            return None
+    
+    def save_last_summary_time(self, time):
+        """保存上次总结时间到文件"""
+        import json
+        logger.info(f"开始保存上次总结时间到文件: {self.LAST_SUMMARY_FILE}")
+        try:
+            time_str = time.isoformat()
+            with open(self.LAST_SUMMARY_FILE, "w", encoding="utf-8") as f:
+                json.dump({'last_summary_time': time_str}, f, ensure_ascii=False, indent=2)
+            logger.info(f"成功保存上次总结时间: {time}")
+        except Exception as e:
+            logger.error(f"保存上次总结时间到文件 {self.LAST_SUMMARY_FILE} 时出错: {type(e).__name__}: {e}")
+    
     async def fetch_last_week_messages(self, channels_to_fetch=None):
-        """抓取过去一周的频道消息
+        """抓取从上次总结时间至今的频道消息
         
         Args:
             channels_to_fetch: 可选，要抓取的频道列表。如果为None，则抓取所有配置的频道。
         """
         # 确保 API_ID 是整数
-        logger.info("开始抓取过去一周的频道消息")
+        logger.info("开始抓取频道消息")
         
         async with TelegramClient('session_name', int(self.API_ID), self.API_HASH) as client:
-            last_week = datetime.now(timezone.utc) - timedelta(days=7)
+            # 确定时间范围
+            current_time = datetime.now(timezone.utc)
+            if self.last_summary_time:
+                # 使用上次总结时间作为起始时间
+                start_time = self.last_summary_time
+                logger.info(f"使用上次总结时间作为起始时间: {start_time}")
+            else:
+                # 如果没有上次总结时间，默认使用过去7天
+                start_time = current_time - timedelta(days=7)
+                logger.info(f"没有上次总结时间，使用默认时间范围: 过去7天 ({start_time})")
+            
             messages_by_channel = {}  # 按频道分组的消息字典
             
             # 确定要抓取的频道
             if channels_to_fetch and isinstance(channels_to_fetch, list):
                 # 只抓取指定的频道
                 channels = channels_to_fetch
-                logger.info(f"正在抓取指定的 {len(channels)} 个频道的消息，时间范围: {last_week} 至今")
+                logger.info(f"正在抓取指定的 {len(channels)} 个频道的消息，时间范围: {start_time} 至今")
             else:
                 # 抓取所有配置的频道
                 if not self.CHANNELS:
                     logger.warning("没有配置任何频道，无法抓取消息")
                     return messages_by_channel
                 channels = self.CHANNELS
-                logger.info(f"正在抓取所有 {len(channels)} 个频道的消息，时间范围: {last_week} 至今")
+                logger.info(f"正在抓取所有 {len(channels)} 个频道的消息，时间范围: {start_time} 至今")
             
             total_message_count = 0
             
@@ -152,7 +205,7 @@ class TelegramSummaryPlugin(Star):
                 channel_message_count = 0
                 logger.info(f"开始抓取频道: {channel}")
                 
-                async for message in client.iter_messages(channel, offset_date=last_week, reverse=True):
+                async for message in client.iter_messages(channel, offset_date=start_time, reverse=True):
                     total_message_count += 1
                     channel_message_count += 1
                     if message.text:
@@ -240,6 +293,12 @@ class TelegramSummaryPlugin(Star):
                 channel_name = channel.split('/')[-1]
                 await self.send_report(f"📋 **{channel_name} 频道周报汇总**\n\n{summary}")
             
+            # 更新上次总结时间
+            current_utc_time = datetime.now(timezone.utc)
+            self.last_summary_time = current_utc_time
+            self.save_last_summary_time(current_utc_time)
+            logger.info(f"已更新上次总结时间: {current_utc_time}")
+            
             end_time = datetime.now()
             processing_time = (end_time - start_time).total_seconds()
             logger.info(f"定时任务完成: {end_time}，总处理时间: {processing_time:.2f}秒")
@@ -309,6 +368,12 @@ class TelegramSummaryPlugin(Star):
                 # 获取频道名称用于报告标题
                 channel_name = channel.split('/')[-1]
                 yield event.plain_result(f"📋 **{channel_name} 频道周报汇总**\n\n{summary}")
+            
+            # 更新上次总结时间
+            current_utc_time = datetime.now(timezone.utc)
+            self.last_summary_time = current_utc_time
+            self.save_last_summary_time(current_utc_time)
+            logger.info(f"已更新上次总结时间: {current_utc_time}")
             
             logger.info(f"命令 {command} 执行成功")
         except Exception as e:
@@ -439,6 +504,29 @@ class TelegramSummaryPlugin(Star):
         except Exception as e:
             logger.error(f"删除频道时出错: {type(e).__name__}: {e}")
             yield event.plain_result(f"删除频道时出错: {e}")
+    
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("clearsummarytime")
+    async def handle_clear_summary_time(self, event: AstrMessageEvent):
+        """清除上次总结时间记录"""
+        sender_id = event.get_sender_id()
+        command = event.message_str
+        logger.info(f"收到命令: {command}，发送者: {sender_id}")
+        
+        try:
+            # 删除上次总结时间文件
+            import os
+            if os.path.exists(self.LAST_SUMMARY_FILE):
+                os.remove(self.LAST_SUMMARY_FILE)
+                logger.info(f"已删除上次总结时间文件: {self.LAST_SUMMARY_FILE}")
+            
+            # 重置内存中的上次总结时间
+            self.last_summary_time = None
+            
+            yield event.plain_result("上次总结时间记录已成功清除\n\n下次总结将使用默认时间范围（过去7天）")
+        except Exception as e:
+            logger.error(f"清除上次总结时间时出错: {type(e).__name__}: {e}")
+            yield event.plain_result(f"清除上次总结时间时出错: {e}")
     
     async def terminate(self):
         """插件被卸载/停用时会调用。"""
