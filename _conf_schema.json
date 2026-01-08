@@ -20,36 +20,15 @@
       }
     }
   },
-  "ai": {
-    "description": "AI 配置",
-    "type": "object",
-    "items": {
-      "api_key": {
-        "description": "LLM API Key",
-        "type": "string",
-        "obvious_hint": true
-      },
-      "base_url": {
-        "description": "LLM Base URL",
-        "type": "string",
-        "default": "https://api.deepseek.com"
-      },
-      "model": {
-        "description": "LLM Model",
-        "type": "string",
-        "default": "deepseek-chat"
-      }
-    }
+  "select_provider": {
+    "description": "选择AI提供商",
+    "type": "string",
+    "_special": "select_provider"
   },
   "channels": {
     "description": "监控的频道列表",
     "type": "list",
     "hint": "每个频道一行，支持完整 URL 或频道名称"
-  },
-  "admin_ids": {
-    "description": "管理员 ID 列表",
-    "type": "list",
-    "hint": "每个管理员 ID 一行"
   },
   "prompt": {
     "description": "AI 总结提示词",

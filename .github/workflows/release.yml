@@ -1,0 +1,72 @@
+name: Auto Release
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'metadata.yaml'
+      - 'CHANGELOG.md'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Extract version from metadata.yaml
+        id: extract_version
+        run: |
+          VERSION=$(grep -E '^version: ' metadata.yaml | awk '{print $2}')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Extract changelog for version
+        id: extract_changelog
+        run: |
+          VERSION=${{ steps.extract_version.outputs.version }}
+          # 使用Python脚本提取对应版本的变更日志
+          python -c "
+          import re
+          import sys
+
+          with open('CHANGELOG.md', 'r', encoding='utf-8') as f:
+              content = f.read()
+
+          # 匹配指定版本的变更日志
+          pattern = rf'## \[v{VERSION}\] - .+?\n(.*?)(?=## \[|$)'  # 注意这里的v前缀
+          match = re.search(pattern, content, re.DOTALL)
+
+          if match:
+              changelog = match.group(1).strip()
+              print(changelog)
+          else:
+              print(f'No changelog found for version v{VERSION}')
+              sys.exit(1)
+          " > changelog.txt
+          
+          # 将变更日志内容设置为output，注意处理多行文本
+          CHANGELOG=$(cat changelog.txt)
+          CHANGELOG="${CHANGELOG//'%'/'%25'}"
+          CHANGELOG="${CHANGELOG//$'\n'/'%0A'}"
+          CHANGELOG="${CHANGELOG//$'\r'/'%0D'}"
+          echo "changelog=$CHANGELOG" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ steps.extract_version.outputs.version }}
+          release_name: Release v${{ steps.extract_version.outputs.version }}
+          body: ${{ steps.extract_changelog.outputs.changelog }}
+          draft: false
+          prerelease: false

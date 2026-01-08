@@ -23,40 +23,15 @@
 
 ## 配置
 
-### 环境变量配置
-
-您可以通过 `.env` 文件配置以下环境变量：
-
-```env
-# Telegram 配置
-TELEGRAM_API_ID=your_api_id
-TELEGRAM_API_HASH=your_api_hash
-TELEGRAM_BOT_TOKEN=your_bot_token
-
-# AI 配置
-LLM_API_KEY=your_llm_api_key
-LLM_BASE_URL=https://api.deepseek.com
-LLM_MODEL=deepseek-chat
-
-# 频道配置
-TARGET_CHANNEL=https://t.me/example1,https://t.me/example2
-
-# 管理员配置
-REPORT_ADMIN_IDS=123456789,987654321
-```
-
 ### AstrBot 配置系统
 
-您也可以通过 AstrBot 的配置系统进行配置，配置项包括：
+通过 AstrBot 的配置系统进行配置，配置项包括：
 
 - `telegram.api_id`: Telegram API ID
 - `telegram.api_hash`: Telegram API Hash
 - `telegram.bot_token`: Telegram Bot Token
-- `ai.api_key`: AI 模型 API Key
-- `ai.base_url`: AI 模型 API 地址
-- `ai.model`: AI 模型名称
+- `_special.select_provider`: AI 提供商选择
 - `channels`: 要监控的频道列表
-- `admin_ids`: 管理员 ID 列表
 - `prompt`: 自定义提示词
 
 ## 使用说明
@@ -81,8 +56,6 @@ REPORT_ADMIN_IDS=123456789,987654321
 | `/summary [channel]` | 立即生成本周频道消息汇总，可指定频道 | 管理员 |
 | `/showprompt` | 查看当前使用的提示词 | 管理员 |
 | `/setprompt` | 设置自定义提示词 | 管理员 |
-| `/showaicfg` | 查看当前 AI 配置 | 管理员 |
-| `/setaicfg` | 设置 AI 配置（API Key、Base URL、Model） | 管理员 |
 | `/showchannels` | 查看当前配置的频道列表 | 管理员 |
 | `/addchannel <url>` | 添加新的监控频道 | 管理员 |
 | `/deletechannel <url>` | 删除监控频道 | 管理员 |

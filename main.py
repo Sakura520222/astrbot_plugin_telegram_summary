@@ -1,20 +1,13 @@
-import os
 import asyncio
 from datetime import datetime, timedelta, timezone
-from dotenv import load_dotenv
 from telethon import TelegramClient
-from openai import OpenAI, AsyncOpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # AstrBot 插件 API
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger # 使用 astrbot 提供的 logger 接口
 from astrbot.api import AstrBotConfig # 使用 astrbot 提供的配置接口
-
-# 加载 .env 文件中的变量
-load_dotenv()
-logger.info("已加载 .env 文件中的环境变量")
 
 @register("telegram_summary", "author", "一个 Telegram 频道消息汇总插件，每周一生成指定频道的消息汇总报告。", "1.0.0", "repo url")
 class TelegramSummaryPlugin(Star):
@@ -36,67 +29,28 @@ class TelegramSummaryPlugin(Star):
         
         # Telegram 配置
         telegram_config = config.get('telegram', {})
-        self.API_ID = telegram_config.get('api_id', os.getenv('TELEGRAM_API_ID'))
-        self.API_HASH = telegram_config.get('api_hash', os.getenv('TELEGRAM_API_HASH'))
-        self.BOT_TOKEN = telegram_config.get('bot_token', os.getenv('TELEGRAM_BOT_TOKEN'))
-        
-        # AI 配置
-        ai_config = config.get('ai', {})
-        self.LLM_API_KEY = ai_config.get('api_key', os.getenv('LLM_API_KEY', os.getenv('DEEPSEEK_API_KEY')))
-        self.LLM_BASE_URL = ai_config.get('base_url', os.getenv('LLM_BASE_URL', 'https://api.deepseek.com'))
-        self.LLM_MODEL = ai_config.get('model', os.getenv('LLM_MODEL', 'deepseek-chat'))
+        self.API_ID = telegram_config.get('api_id')
+        self.API_HASH = telegram_config.get('api_hash')
+        self.BOT_TOKEN = telegram_config.get('bot_token')
         
         # 频道配置
         self.CHANNELS = config.get('channels', [])
-        if not self.CHANNELS:
-            # 从环境变量获取默认值
-            TARGET_CHANNEL = os.getenv('TARGET_CHANNEL')
-            if TARGET_CHANNEL:
-                # 支持多个频道，用逗号分隔
-                self.CHANNELS = [channel.strip() for channel in TARGET_CHANNEL.split(',')]
-                logger.info(f"已从环境变量加载频道配置: {self.CHANNELS}")
-        else:
-            logger.info(f"已从 AstrBot 配置加载频道列表: {self.CHANNELS}")
+        logger.info(f"已从 AstrBot 配置加载频道列表: {self.CHANNELS}")
         
-        # 管理员 ID 列表
-        admin_ids = config.get('admin_ids', [])
-        if admin_ids:
-            self.ADMIN_LIST = [int(admin_id) for admin_id in admin_ids]
-            logger.info(f"已从 AstrBot 配置加载管理员ID列表: {self.ADMIN_LIST}")
-        else:
-            # 从环境变量获取默认值
-            REPORT_ADMIN_IDS = os.getenv('REPORT_ADMIN_IDS', '')
-            logger.debug(f"从环境变量读取的管理员ID: {REPORT_ADMIN_IDS}")
-            if REPORT_ADMIN_IDS:
-                self.ADMIN_LIST = [int(admin_id.strip()) for admin_id in REPORT_ADMIN_IDS.split(',')]
-                logger.info(f"已从环境变量加载管理员ID列表: {self.ADMIN_LIST}")
-            else:
-                # 如果没有配置管理员ID，默认发送给自己
-                self.ADMIN_LIST = ['me']
-                logger.info("未配置管理员ID，默认发送给机器人所有者")
+        # 管理员ID列表不再需要，使用AstrBot框架的权限检查机制
+        self.ADMIN_LIST = ['me']
         
         # 提示词配置
         self.CURRENT_PROMPT = config.get('prompt', self.DEFAULT_PROMPT)
         logger.info("已加载提示词配置")
         logger.debug(f"当前提示词: {self.CURRENT_PROMPT[:100]}..." if len(self.CURRENT_PROMPT) > 100 else f"当前提示词: {self.CURRENT_PROMPT}")
         
-        # 初始化 AI 客户端
-        logger.info("开始初始化AI客户端...")
-        logger.debug(f"AI客户端配置: Base URL={self.LLM_BASE_URL}, Model={self.LLM_MODEL}, API Key={'***' if self.LLM_API_KEY else '未设置'}")
-        
-        self.client_llm = AsyncOpenAI(
-            api_key=self.LLM_API_KEY, 
-            base_url=self.LLM_BASE_URL
-        )
-        
-        logger.info("AI客户端初始化完成")
+        # 从AstrBot配置获取AI提供商信息
+        self.ai_provider = config.get('select_provider')
+        logger.info(f"已加载AI提供商配置: {self.ai_provider}")
         
         # 全局变量，用于跟踪正在设置提示词的用户
         self.setting_prompt_users = set()
-        # 全局变量，用于跟踪正在设置AI配置的用户
-        self.setting_ai_config_users = set()
-        # 全局变量，用于存储正在配置中的AI参数
-        self.current_ai_config = {}
         
         # 初始化调度器
         self.scheduler = AsyncIOScheduler()
@@ -229,26 +183,24 @@ class TelegramSummaryPlugin(Star):
         context_text = "\n\n---\n\n".join(messages)
         prompt = f"{self.CURRENT_PROMPT}{context_text}"
         
-        logger.debug(f"AI请求配置: 模型={self.LLM_MODEL}, 提示词长度={len(self.CURRENT_PROMPT)}字符, 上下文长度={len(context_text)}字符")
+        logger.debug(f"AI请求配置: 提供商={self.ai_provider}, 提示词长度={len(self.CURRENT_PROMPT)}字符, 上下文长度={len(context_text)}字符")
         logger.debug(f"AI请求总长度: {len(prompt)}字符")
         
         try:
             start_time = datetime.now()
-            response = await self.client_llm.chat.completions.create(
-                model=self.LLM_MODEL,
-                messages=[
-                    {"role": "system", "content": "你是一个专业的资讯摘要助手，擅长提取重点并保持客观。"},
-                    {"role": "user", "content": prompt},
-                ]
+            # 使用AstrBot框架提供的AI调用机制
+            response = await self.context.llm_generate(
+                chat_provider_id=self.ai_provider,
+                prompt=prompt,
+                system_prompt="你是一个专业的资讯摘要助手，擅长提取重点并保持客观。"
             )
             end_time = datetime.now()
             
             processing_time = (end_time - start_time).total_seconds()
             logger.info(f"AI分析完成，处理时间: {processing_time:.2f}秒")
-            logger.debug(f"AI响应状态: 成功，选择索引={response.choices[0].index}, 完成原因={response.choices[0].finish_reason}")
-            logger.debug(f"AI响应长度: {len(response.choices[0].message.content)}字符")
+            logger.debug(f"AI响应长度: {len(response.completion_text)}字符")
             
-            return response.choices[0].message.content
+            return response.completion_text
         except Exception as e:
             logger.error(f"AI分析失败: {type(e).__name__}: {e}")
             return f"AI 分析失败: {e}"
@@ -297,70 +249,21 @@ class TelegramSummaryPlugin(Star):
             logger.error(f"定时任务执行失败: {type(e).__name__}: {e}，开始时间: {start_time}，结束时间: {end_time}，处理时间: {processing_time:.2f}秒")
     
     async def send_long_message(self, client, chat_id, text, max_length=4000):
-        """分段发送长消息"""
-        logger.info(f"开始发送长消息，接收者: {chat_id}，消息总长度: {len(text)}字符，最大分段长度: {max_length}字符")
-        
-        if len(text) <= max_length:
-            logger.info(f"消息长度未超过限制，直接发送")
-            await client.send_message(chat_id, text, link_preview=False)
-            return
-        
-        # 提取频道名称用于分段消息标题
-        channel_title = "频道周报汇总"
-        if "**" in text and "** " in text:
-            # 提取 ** 之间的频道名称
-            start_idx = text.index("**") + 2
-            end_idx = text.index("** ", start_idx)
-            channel_title = text[start_idx:end_idx]
-        
-        # 分段发送
-        parts = []
-        current_part = ""
-        
-        logger.info(f"消息需要分段发送，开始分段处理")
-        for line in text.split('\n'):
-            # 检查添加当前行是否超过限制
-            if len(current_part) + len(line) + 1 <= max_length:
-                current_part += line + '\n'
-            else:
-                # 如果当前部分不为空，添加到列表
-                if current_part:
-                    parts.append(current_part.strip())
-                # 检查当前行是否超过限制
-                if len(line) > max_length:
-                    # 对超长行进行进一步分割
-                    logger.warning(f"发现超长行，长度: {len(line)}字符，将进一步分割")
-                    for i in range(0, len(line), max_length):
-                        parts.append(line[i:i+max_length])
-                else:
-                    current_part = line + '\n'
-        
-        # 添加最后一部分
-        if current_part:
-            parts.append(current_part.strip())
-        
-        logger.info(f"消息分段完成，共分成 {len(parts)} 段")
-        
-        # 发送所有部分
-        for i, part in enumerate(parts):
-            logger.info(f"正在发送第 {i+1}/{len(parts)} 段，长度: {len(part)}字符")
-            await client.send_message(chat_id, f"📋 **{channel_title} ({i+1}/{len(parts)})**\n\n{part}", link_preview=False)
-            logger.debug(f"成功发送第 {i+1}/{len(parts)} 段")
+        """发送消息，不再分段"""
+        logger.info(f"开始发送消息，接收者: {chat_id}，消息总长度: {len(text)}字符")
+        # 直接发送完整消息，不进行分段
+        await client.send_message(chat_id, text, link_preview=False)
+        logger.info("消息发送完成")
     
     # ========== 命令处理 ==========
     
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("summary")
     async def handle_manual_summary(self, event: AstrMessageEvent):
         """立即生成本周频道消息汇总"""
         sender_id = event.get_sender_id()
         command = event.message_str
         logger.info(f"收到命令: {command}，发送者: {sender_id}")
-        
-        # 检查发送者是否为管理员
-        if sender_id not in self.ADMIN_LIST and self.ADMIN_LIST != ['me']:
-            logger.warning(f"发送者 {sender_id} 没有权限执行命令 {command}")
-            yield event.plain_result("您没有权限执行此命令")
-            return
         
         # 发送正在处理的消息
         yield event.plain_result("正在为您生成本周总结...")
@@ -412,6 +315,7 @@ class TelegramSummaryPlugin(Star):
             logger.error(f"执行命令 {command} 时出错: {type(e).__name__}: {e}")
             yield event.plain_result(f"生成总结时出错: {e}")
     
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("showprompt")
     async def handle_show_prompt(self, event: AstrMessageEvent):
         """查看当前提示词"""
@@ -419,15 +323,10 @@ class TelegramSummaryPlugin(Star):
         command = event.message_str
         logger.info(f"收到命令: {command}，发送者: {sender_id}")
         
-        # 检查发送者是否为管理员
-        if sender_id not in self.ADMIN_LIST and self.ADMIN_LIST != ['me']:
-            logger.warning(f"发送者 {sender_id} 没有权限执行命令 {command}")
-            yield event.plain_result("您没有权限执行此命令")
-            return
-        
         logger.info(f"执行命令 {command} 成功")
         yield event.plain_result(f"当前提示词：\n\n{self.CURRENT_PROMPT}")
     
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("setprompt")
     async def handle_set_prompt(self, event: AstrMessageEvent):
         """设置自定义提示词"""
@@ -435,78 +334,20 @@ class TelegramSummaryPlugin(Star):
         command = event.message_str
         logger.info(f"收到命令: {command}，发送者: {sender_id}")
         
-        # 检查发送者是否为管理员
-        if sender_id not in self.ADMIN_LIST and self.ADMIN_LIST != ['me']:
-            logger.warning(f"发送者 {sender_id} 没有权限执行命令 {command}")
-            yield event.plain_result("您没有权限执行此命令")
-            return
-        
         # 添加用户到正在设置提示词的集合中
         self.setting_prompt_users.add(sender_id)
         logger.info(f"添加用户 {sender_id} 到提示词设置集合")
         yield event.plain_result(f"请发送新的提示词，我将使用它来生成总结。\n\n当前提示词：\n{self.CURRENT_PROMPT}")
     
-    @filter.command("showaicfg")
-    async def handle_show_ai_config(self, event: AstrMessageEvent):
-        """查看AI配置"""
-        sender_id = event.get_sender_id()
-        command = event.message_str
-        logger.info(f"收到命令: {command}，发送者: {sender_id}")
-        
-        # 检查发送者是否为管理员
-        if sender_id not in self.ADMIN_LIST and self.ADMIN_LIST != ['me']:
-            logger.warning(f"发送者 {sender_id} 没有权限执行命令 {command}")
-            yield event.plain_result("您没有权限执行此命令")
-            return
-        
-        # 显示当前配置
-        config_info = f"当前AI配置：\n\n"
-        config_info += f"API Key：{self.LLM_API_KEY[:10]}...{self.LLM_API_KEY[-10:] if len(self.LLM_API_KEY) > 20 else self.LLM_API_KEY}\n"
-        config_info += f"Base URL：{self.LLM_BASE_URL}\n"
-        config_info += f"Model：{self.LLM_MODEL}\n"
-        
-        logger.info(f"执行命令 {command} 成功")
-        yield event.plain_result(config_info)
+
     
-    @filter.command("setaicfg")
-    async def handle_set_ai_config(self, event: AstrMessageEvent):
-        """设置AI配置"""
-        sender_id = event.get_sender_id()
-        command = event.message_str
-        logger.info(f"收到命令: {command}，发送者: {sender_id}")
-        
-        # 检查发送者是否为管理员
-        if sender_id not in self.ADMIN_LIST and self.ADMIN_LIST != ['me']:
-            logger.warning(f"发送者 {sender_id} 没有权限执行命令 {command}")
-            yield event.plain_result("您没有权限执行此命令")
-            return
-        
-        # 添加用户到正在设置AI配置的集合中
-        self.setting_ai_config_users.add(sender_id)
-        logger.info(f"添加用户 {sender_id} 到AI配置设置集合")
-        
-        # 初始化当前配置，使用None值来标识未处理的参数
-        self.current_ai_config = {
-            'api_key': None,
-            'base_url': None,
-            'model': None
-        }
-        
-        logger.info(f"开始执行 {command} 命令")
-        yield event.plain_result("请依次发送以下AI配置参数，或发送/skip跳过：\n\n1. API Key\n2. Base URL\n3. Model\n\n发送/cancel取消设置")
-    
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("showchannels")
     async def handle_show_channels(self, event: AstrMessageEvent):
         """查看当前频道列表"""
         sender_id = event.get_sender_id()
         command = event.message_str
         logger.info(f"收到命令: {command}，发送者: {sender_id}")
-        
-        # 检查发送者是否为管理员
-        if sender_id not in self.ADMIN_LIST and self.ADMIN_LIST != ['me']:
-            logger.warning(f"发送者 {sender_id} 没有权限执行命令 {command}")
-            yield event.plain_result("您没有权限执行此命令")
-            return
         
         logger.info(f"执行命令 {command} 成功")
         
@@ -521,18 +362,13 @@ class TelegramSummaryPlugin(Star):
         
         yield event.plain_result(channels_msg)
     
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("addchannel")
     async def handle_add_channel(self, event: AstrMessageEvent):
         """添加频道"""
         sender_id = event.get_sender_id()
         command = event.message_str
         logger.info(f"收到命令: {command}，发送者: {sender_id}")
-        
-        # 检查发送者是否为管理员
-        if sender_id not in self.ADMIN_LIST and self.ADMIN_LIST != ['me']:
-            logger.warning(f"发送者 {sender_id} 没有权限执行命令 {command}")
-            yield event.plain_result("您没有权限执行此命令")
-            return
         
         try:
             _, channel_url = command.split(maxsplit=1)
@@ -565,18 +401,13 @@ class TelegramSummaryPlugin(Star):
             logger.error(f"添加频道时出错: {type(e).__name__}: {e}")
             yield event.plain_result(f"添加频道时出错: {e}")
     
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("deletechannel")
     async def handle_delete_channel(self, event: AstrMessageEvent):
         """删除频道"""
         sender_id = event.get_sender_id()
         command = event.message_str
         logger.info(f"收到命令: {command}，发送者: {sender_id}")
-        
-        # 检查发送者是否为管理员
-        if sender_id not in self.ADMIN_LIST and self.ADMIN_LIST != ['me']:
-            logger.warning(f"发送者 {sender_id} 没有权限执行命令 {command}")
-            yield event.plain_result("您没有权限执行此命令")
-            return
         
         try:
             _, channel_url = command.split(maxsplit=1)
