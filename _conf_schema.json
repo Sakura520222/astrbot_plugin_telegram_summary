@@ -1,0 +1,65 @@
+{
+  "telegram": {
+    "description": "Telegram 配置",
+    "type": "object",
+    "items": {
+      "api_id": {
+        "description": "Telegram API ID",
+        "type": "string",
+        "obvious_hint": true
+      },
+      "api_hash": {
+        "description": "Telegram API Hash",
+        "type": "string",
+        "obvious_hint": true
+      },
+      "bot_token": {
+        "description": "Telegram Bot Token",
+        "type": "string",
+        "obvious_hint": true
+      }
+    }
+  },
+  "ai": {
+    "description": "AI 配置",
+    "type": "object",
+    "items": {
+      "api_key": {
+        "description": "LLM API Key",
+        "type": "string",
+        "obvious_hint": true
+      },
+      "base_url": {
+        "description": "LLM Base URL",
+        "type": "string",
+        "default": "https://api.deepseek.com"
+      },
+      "model": {
+        "description": "LLM Model",
+        "type": "string",
+        "default": "deepseek-chat"
+      }
+    }
+  },
+  "channels": {
+    "description": "监控的频道列表",
+    "type": "list",
+    "hint": "每个频道一行，支持完整 URL 或频道名称"
+  },
+  "admin_ids": {
+    "description": "管理员 ID 列表",
+    "type": "list",
+    "hint": "每个管理员 ID 一行"
+  },
+  "prompt": {
+    "description": "AI 总结提示词",
+    "type": "text",
+    "default": "请总结以下 Telegram 消息，提取核心要点并列出重要消息的链接：\n\n"
+  },
+  "log_level": {
+    "description": "日志级别",
+    "type": "string",
+    "options": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+    "default": "INFO"
+  }
+}

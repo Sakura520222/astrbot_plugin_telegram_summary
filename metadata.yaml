@@ -1,0 +1,8 @@
+# 插件元数据
+name: astrbot_plugin_telegram_summary
+version: 1.0.0
+author: Sakura520222
+description: 一个 Telegram 频道消息汇总插件，生成指定频道的消息汇总报告，目前自用，转自我的另一个项目。
+repository: https://github.com/Sakura520222/astrbot_plugin_telegram_summary
+# 可选的插件展示名
+display_name: Telegram 频道消息汇总
