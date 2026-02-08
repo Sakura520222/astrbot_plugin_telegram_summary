@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """AstrBot Telegram频道消息总结插件"""
 import asyncio
 import os
@@ -9,40 +8,99 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # AstrBot 插件 API
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 
-@register("telegram_summary", "Sakura520222", "一个 Telegram 频道消息总结插件，每周一生成指定频道的消息总结报告。", "1.0.1", "https://github.com/Sakura520222/astrbot_plugin_telegram_summary")
+@register("telegram_summary", "Sakura520222", "一个 Telegram 频道消息总结插件，每周自动生成指定频道的消息汇总报告，支持自动推送到QQ群组和用户。", "1.1.0", "https://github.com/Sakura520222/astrbot_plugin_telegram_summary")
 class TelegramSummaryPlugin(Star):
+    """Telegram 频道消息总结插件
+    
+    定期抓取指定 Telegram 频道的消息，使用 AI 生成周报总结，
+    并自动推送到配置的群组和用户。
+    """
+    
+    # 类常量定义
+    DEFAULT_SUMMARY_DAYS = 7  # 默认总结时间范围（天）
+    SESSION_TIMEOUT = 120  # 登录会话超时时间（秒）
+    MESSAGE_TRUNCATE_LENGTH = 500  # 消息截断长度
+    PUSH_DELAY_MIN = 1  # 推送延迟最小值（秒）
+    PUSH_DELAY_MAX = 3  # 推送延迟最大值（秒）
+    PROTOCOL_PREFIX_QQ_GROUP = "QQ:GroupMessage:"
+    PROTOCOL_PREFIX_QQ_FRIEND = "QQ:FriendMessage:"
+    TELEGRAM_URL_PREFIX = "https://t.me/"
+    
+    DEFAULT_AUTO_SUMMARY_TIME = "周一 09:00"
+    
     def __init__(self, context: Context, config: AstrBotConfig):
+        """初始化插件
+        
+        Args:
+            context: AstrBot 上下文对象
+            config: 插件配置对象
+        """
         super().__init__(context)
         self.config = config
         
-        # 初始化数据目录路径
-        self.data_dir = Path("data/plugin_data/astrbot_plugin_telegram_summary")
+        # 按职责拆分初始化流程
         self._init_data_directory()
-        
-        # 配置文件（使用规范的数据目录路径）
+        self._init_file_paths()
+        self._init_constants()
+        self._load_configurations(config)
+        self._init_concurrent_safety()
+        self._init_runtime_state()
+        self._setup_scheduler()
+    
+    def _init_data_directory(self):
+        """初始化数据目录"""
+        # 使用框架提供的规范方法获取数据目录
+        self.data_dir = StarTools.get_data_dir()
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"数据目录已准备: {self.data_dir}")
+    
+    def _init_file_paths(self):
+        """初始化文件路径配置"""
         self.PROMPT_FILE = str(self.data_dir / "prompt.txt")
         self.CONFIG_FILE = str(self.data_dir / "config.json")
         self.RESTART_FLAG_FILE = str(self.data_dir / ".restart_flag")
         self.LAST_SUMMARY_FILE = str(self.data_dir / "last_summary_time.json")
-        
-        # 会话文件路径配置（使用固定的session文件）
         self.USER_SESSION_FILE = str(self.data_dir / "user_session.session")
         
-        logger.info(f"用户会话文件: {self.USER_SESSION_FILE}")
+        logger.debug(f"配置文件路径: 提示词={self.PROMPT_FILE}, "
+                    f"配置={self.CONFIG_FILE}, "
+                    f"上次总结={self.LAST_SUMMARY_FILE}, "
+                    f"会话={self.USER_SESSION_FILE}")
+    
+    def _init_constants(self):
+        """初始化常量配置"""
+        self.DEFAULT_PROMPT = (
+            "请对以下提供的文本内容进行分类总结，并严格遵守以下规则：\n\n"
+            "## 一、 语言与布局\n"
+            "1. **禁止废话**：直接输出总结后的内容，严禁包含任何前言、备注、解释或后语。\n\n"
+            "## 二、 格式与排版\n"
+            "1. **主标题**：格式为\"一、xxx\"。\n"
+            "2. **层级符号**：\n"
+            "   - 一级标题使用 ●\n"
+            "   - 二级标题使用 ○\n"
+            "   - 三级内容使用 -\n"
+            "   - 必须配合恰当的缩进以体现层级。\n"
+            "3. 禁止使用 Markdown 格式。\n\n"
+            "## 三、 标题与链接处理\n"
+            "1. **内容提取**：提取每条消息的核心内容或标题。\n\n"
+            "## 四、 内容精简规则\n"
+            "1. **删除冗余**：\n"
+            "   - 删除所有 source 来源信息（如 Source: XXX 或任何出处链接）。\n"
+            "   - 删除所有标签（Tags）。\n"
+            "2. **精炼表达**：不要原文复制，对内容进行脱水总结，仅保留关键点。\n"
+            "3. **忠于原文**：严禁添加、脑补任何原文中没有的内容。\n\n"
+        )
+    
+    def _load_configurations(self, config: AstrBotConfig):
+        """从配置系统加载所有配置
         
-        logger.debug(f"配置文件路径: 提示词文件={self.PROMPT_FILE}, "
-                    f"配置文件={self.CONFIG_FILE}, "
-                    f"上次总结时间文件={self.LAST_SUMMARY_FILE}, "
-                    f"用户会话文件={self.USER_SESSION_FILE}")
-        
-        # 默认提示词
-        self.DEFAULT_PROMPT = "请对以下提供的文本内容进行分类总结，并严格遵守以下规则：\n\n## 一、 语言与布局\n1. **禁止废话**：直接输出总结后的内容，严禁包含任何前言、备注、解释或后语。\n\n## 二、 格式与排版\n1. **主标题**：格式为\"一、xxx\"。\n2. **层级符号**：\n    - 一级标题使用 ●\n    - 二级标题使用 ○\n    - 三级内容使用 -\n    - 必须配合恰当的缩进以体现层级。\n3. 禁止使用 Markdown 格式。\n\n## 三、 标题与链接处理\n1. **内容提取**：提取每条消息的核心内容或标题。\n\n## 四、 内容精简规则\n1. **删除冗余**：\n    - 删除所有 source 来源信息（如 Source: XXX 或任何出处链接）。\n    - 删除所有标签（Tags）。\n2. **精炼表达**：不要原文复制，对内容进行脱水总结，仅保留关键点。\n3. **忠于原文**：严禁添加、脑补任何原文中没有的内容。\n\n"
-        
-        # 从 AstrBot 配置系统读取配置
+        Args:
+            config: AstrBot 配置对象
+        """
         logger.info("开始从 AstrBot 配置系统加载配置...")
         
         # Telegram 配置
@@ -52,55 +110,83 @@ class TelegramSummaryPlugin(Star):
         
         # 频道配置
         self.CHANNELS = config.get('channels', [])
-        logger.info(f"已从 AstrBot 配置加载频道列表: {self.CHANNELS}")
-        
-        # 管理员ID列表不再需要，使用AstrBot框架的权限检查机制
-        self.ADMIN_LIST = ['me']
+        logger.info(f"已加载频道列表: {self.CHANNELS}")
         
         # 提示词配置
         self.CURRENT_PROMPT = config.get('prompt', self.DEFAULT_PROMPT)
         logger.info("已加载提示词配置")
-        logger.debug(f"当前提示词: {self.CURRENT_PROMPT[:100]}..." if len(self.CURRENT_PROMPT) > 100 else f"当前提示词: {self.CURRENT_PROMPT}")
         
-        # 从AstrBot配置获取AI提供商信息
+        # AI 提供商配置
         self.ai_provider = config.get('select_provider')
-        logger.info(f"已加载AI提供商配置: {self.ai_provider}")
+        logger.info(f"已加载AI提供商: {self.ai_provider}")
         
         # 自动总结时间配置
-        self.auto_summary_time = config.get('auto_summary_time', '周一 09:00')
-        logger.info(f"已加载自动总结时间配置: {self.auto_summary_time}")
+        self.auto_summary_time = config.get('auto_summary_time', self.DEFAULT_AUTO_SUMMARY_TIME)
+        logger.info(f"已加载自动总结时间: {self.auto_summary_time}")
         
-        # 自动推送目标配置（群组和用户分开）
+        # 自动推送目标配置
         self.auto_push_groups = config.get('auto_push_groups', [])
         self.auto_push_users = config.get('auto_push_users', [])
-        logger.info(f"已加载推送目标配置: 群组 {len(self.auto_push_groups)} 个, 用户 {len(self.auto_push_users)} 个")
-        
-        # 全局变量，用于跟踪正在设置提示词的用户
+        logger.info(f"已加载推送目标: 群组 {len(self.auto_push_groups)} 个, 用户 {len(self.auto_push_users)} 个")
+    
+    def _init_concurrent_safety(self):
+        """初始化并发安全机制"""
+        self._setting_prompt_lock = asyncio.Lock()
+        self._login_states_lock = asyncio.Lock()
+        logger.debug("并发安全锁已初始化")
+    
+    def _init_runtime_state(self):
+        """初始化运行时状态"""
         self.setting_prompt_users = set()
-        
-        # 登录状态存储（用户ID -> 登录阶段和数据）
         self.login_states = {}
-        
-        # 加载上次总结时间（每个频道独立）
         self.last_summary_times = self.load_last_summary_times()
         logger.info(f"已加载各频道上次总结时间: {self.last_summary_times}")
-        
-        # 初始化调度器
+    
+    def _setup_scheduler(self):
+        """设置定时任务调度器"""
         self.scheduler = AsyncIOScheduler()
-        # 根据配置的时间设置定时任务
         day_of_week, hour, minute = self.parse_summary_time(self.auto_summary_time)
         self.scheduler.add_job(self.main_job, 'cron', day_of_week=day_of_week, hour=hour, minute=minute)
         logger.info(f"定时任务已配置：{self.auto_summary_time}")
         self.scheduler.start()
         logger.info("调度器已启动")
     
-    def _init_data_directory(self):
-        """初始化数据目录"""
-        logger.info("开始初始化数据目录")
+    def _extract_channel_name(self, channel: str) -> str:
+        """从频道标识符中提取频道名称
         
-        # 创建数据目录（如果不存在）
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"数据目录已准备: {self.data_dir}")
+        Args:
+            channel: 频道标识符（可能是完整URL或频道名）
+        
+        Returns:
+            str: 提取后的频道名称
+        """
+        return channel.split('/')[-1]
+    
+    def _match_channel(self, user_input: str, config_channel: str) -> bool:
+        """匹配用户输入的频道与配置中的频道
+        
+        支持多种匹配方式：完全匹配、频道名匹配、URL转换匹配
+        
+        Args:
+            user_input: 用户输入的频道标识符
+            config_channel: 配置中的频道标识符
+        
+        Returns:
+            bool: 是否匹配
+        """
+        # 提取频道名称
+        config_channel_name = self._extract_channel_name(config_channel)
+        user_channel_name = self._extract_channel_name(user_input)
+        
+        # 匹配逻辑（双向匹配）
+        return (
+            user_input == config_channel or  # 完全相同
+            user_input == config_channel_name or  # 用户输入的是频道名，配置也是频道名
+            user_channel_name == config_channel_name or  # 提取后的频道名相同
+            (not user_input.startswith('http') and f"{self.TELEGRAM_URL_PREFIX}{user_input}" == config_channel) or  # 频道名 -> URL
+            (not config_channel.startswith('http') and f"{self.TELEGRAM_URL_PREFIX}{config_channel}" == user_input) or  # 频道名 <- URL
+            (user_input.startswith('http') and config_channel.startswith('http') and user_input == config_channel)  # 两个都是URL
+        )
     
     def load_prompt(self):
         """从文件中读取提示词，如果文件不存在则使用默认提示词"""
@@ -207,63 +293,78 @@ class TelegramSummaryPlugin(Star):
         
         Returns:
             dict: 按频道分组的消息字典 {channel: [messages]}
+        
+        Raises:
+            Exception: 网络中断、认证失败等异常会向上传播
         """
         # 确保 API_ID 是整数
         logger.info("开始抓取频道消息")
         
-        async with TelegramClient(self.USER_SESSION_FILE, int(self.API_ID), self.API_HASH) as client:
-            current_time = datetime.now(timezone.utc)
-            
-            messages_by_channel = {}  # 按频道分组的消息字典
-            
-            # 确定要抓取的频道
-            if channels_to_fetch and isinstance(channels_to_fetch, list):
-                # 只抓取指定的频道
-                channels = channels_to_fetch
-                logger.info(f"正在抓取指定的 {len(channels)} 个频道的消息")
-            else:
-                # 抓取所有配置的频道
-                if not self.CHANNELS:
-                    logger.warning("没有配置任何频道，无法抓取消息")
-                    return messages_by_channel
-                channels = self.CHANNELS
-                logger.info(f"正在抓取所有 {len(channels)} 个频道的消息")
-            
-            total_message_count = 0
-            
-            # 遍历所有要抓取的频道
-            for channel in channels:
-                channel_messages = []
-                channel_message_count = 0
-                logger.info(f"开始抓取频道: {channel}")
+        try:
+            async with TelegramClient(self.USER_SESSION_FILE, int(self.API_ID), self.API_HASH) as client:
+                current_time = datetime.now(timezone.utc)
                 
-                # 为每个频道确定独立的起始时间
-                if channel in self.last_summary_times and self.last_summary_times[channel]:
-                    start_time = self.last_summary_times[channel]
-                    logger.info(f"频道 {channel} 使用上次总结时间作为起始时间: {start_time}")
+                messages_by_channel = {}  # 按频道分组的消息字典
+                
+                # 确定要抓取的频道
+                if channels_to_fetch and isinstance(channels_to_fetch, list):
+                    # 只抓取指定的频道
+                    channels = channels_to_fetch
+                    logger.info(f"正在抓取指定的 {len(channels)} 个频道的消息")
                 else:
-                    start_time = current_time - timedelta(days=7)
-                    logger.info(f"频道 {channel} 没有上次总结时间，使用默认时间范围: 过去7天 ({start_time})")
+                    # 抓取所有配置的频道
+                    if not self.CHANNELS:
+                        logger.warning("没有配置任何频道，无法抓取消息")
+                        return messages_by_channel
+                    channels = self.CHANNELS
+                    logger.info(f"正在抓取所有 {len(channels)} 个频道的消息")
                 
-                async for message in client.iter_messages(channel, offset_date=start_time, reverse=True):
-                    total_message_count += 1
-                    channel_message_count += 1
-                    if message.text:
-                        # 动态获取频道名用于生成链接
-                        channel_part = channel.split('/')[-1]
-                        msg_link = f"https://t.me/{channel_part}/{message.id}"
-                        channel_messages.append(f"内容: {message.text[:500]}\n链接: {msg_link}")
+                total_message_count = 0
+                
+                # 遍历所有要抓取的频道
+                for channel in channels:
+                    channel_messages = []
+                    channel_message_count = 0
+                    logger.info(f"开始抓取频道: {channel}")
+                    
+                    try:
+                        # 为每个频道确定独立的起始时间
+                        if channel in self.last_summary_times and self.last_summary_times[channel]:
+                            start_time = self.last_summary_times[channel]
+                            logger.info(f"频道 {channel} 使用上次总结时间作为起始时间: {start_time}")
+                        else:
+                            start_time = current_time - timedelta(days=self.DEFAULT_SUMMARY_DAYS)
+                            logger.info(f"频道 {channel} 没有上次总结时间，使用默认时间范围: 过去{self.DEFAULT_SUMMARY_DAYS}天 ({start_time})")
                         
-                        # 每抓取10条消息记录一次日志
-                        if len(channel_messages) % 10 == 0:
-                            logger.debug(f"频道 {channel} 已抓取 {len(channel_messages)} 条有效消息")
+                        # 异步迭代消息，添加网络中断保护
+                        async for message in client.iter_messages(channel, offset_date=start_time, reverse=True):
+                            total_message_count += 1
+                            channel_message_count += 1
+                            if message.text:
+                                # 动态获取频道名用于生成链接
+                                channel_part = self._extract_channel_name(channel)
+                                msg_link = f"{self.TELEGRAM_URL_PREFIX}{channel_part}/{message.id}"
+                                channel_messages.append(f"内容: {message.text[:self.MESSAGE_TRUNCATE_LENGTH]}\n链接: {msg_link}")
+                                
+                                # 每抓取10条消息记录一次日志
+                                if len(channel_messages) % 10 == 0:
+                                    logger.debug(f"频道 {channel} 已抓取 {len(channel_messages)} 条有效消息")
+                    
+                    except Exception as channel_error:
+                        logger.error(f"抓取频道 {channel} 时出错: {type(channel_error).__name__}: {channel_error}")
+                        # 继续处理其他频道，不中断整个流程
+                        channel_messages = []
+                    
+                    # 将当前频道的消息添加到字典中
+                    messages_by_channel[channel] = channel_messages
+                    logger.info(f"频道 {channel} 抓取完成，共处理 {channel_message_count} 条消息，其中 {len(channel_messages)} 条包含文本内容")
                 
-                # 将当前频道的消息添加到字典中
-                messages_by_channel[channel] = channel_messages
-                logger.info(f"频道 {channel} 抓取完成，共处理 {channel_message_count} 条消息，其中 {len(channel_messages)} 条包含文本内容")
-            
-            logger.info(f"所有指定频道消息抓取完成，共处理 {total_message_count} 条消息")
-            return messages_by_channel
+                logger.info(f"所有指定频道消息抓取完成，共处理 {total_message_count} 条消息")
+                return messages_by_channel
+        
+        except Exception as e:
+            logger.error(f"Telegram客户端连接失败: {type(e).__name__}: {e}")
+            raise Exception(f"无法连接到Telegram: 请检查网络连接和登录状态") from e
     
     async def analyze_with_ai(self, messages):
         """调用 AI 进行总结"""
@@ -280,14 +381,14 @@ class TelegramSummaryPlugin(Star):
         logger.debug(f"AI请求总长度: {len(prompt)}字符")
         
         try:
-            start_time = datetime.now()
+            start_time = datetime.now(timezone.utc)
             # 使用AstrBot框架提供的AI调用机制
             response = await self.context.llm_generate(
                 chat_provider_id=self.ai_provider,
                 prompt=prompt,
                 system_prompt="你是一个专业的资讯摘要助手，擅长提取重点并保持客观。"
             )
-            end_time = datetime.now()
+            end_time = datetime.now(timezone.utc)
             
             processing_time = (end_time - start_time).total_seconds()
             logger.info(f"AI分析完成，处理时间: {processing_time:.2f}秒")
@@ -295,54 +396,122 @@ class TelegramSummaryPlugin(Star):
             
             return response.completion_text
         except Exception as e:
-            logger.error(f"AI分析失败: {type(e).__name__}: {e}")
-            return f"AI 分析失败: {e}"
+            logger.error(f"AI分析失败: {type(e).__name__}: {e}", exc_info=True)
+            return "AI 分析失败，请检查AI提供商配置和网络连接"
     
-    def parse_summary_time(self, time_str):
-        """解析自动总结时间配置
+    def _parse_time_string(self, time_str: str) -> tuple:
+        """解析时间字符串为星期和时间部分
         
         Args:
             time_str: 时间字符串，格式如 "周一 09:00"
         
         Returns:
+            tuple: (week_day, time_part) 星期部分和时间部分
+        
+        Raises:
+            ValueError: 当时间格式不正确时
+        """
+        parts = time_str.split()
+        if len(parts) != 2:
+            raise ValueError(f"时间格式错误，应为 '星期 时间'，实际为: {time_str}")
+        
+        return parts[0], parts[1]
+    
+    def _parse_week_day(self, week_day: str) -> str:
+        """将中文星期转换为 APScheduler 格式
+        
+        Args:
+            week_day: 中文星期（如"周一"、"二"等）
+        
+        Returns:
+            str: APScheduler 格式的星期（如"mon"、"tue"等）
+        """
+        week_map = {
+            '周一': 'mon',
+            '周二': 'tue',
+            '周三': 'wed',
+            '周四': 'thu',
+            '周五': 'fri',
+            '周六': 'sat',
+            '周日': 'sun',
+            '一': 'mon',
+            '二': 'tue',
+            '三': 'wed',
+            '四': 'thu',
+            '五': 'fri',
+            '六': 'sat',
+            '日': 'sun'
+        }
+        return week_map.get(week_day, 'mon')
+    
+    def _parse_hour_minute(self, time_part: str) -> tuple:
+        """解析时间部分为小时和分钟
+        
+        Args:
+            time_part: 时间字符串，格式如 "09:00"
+        
+        Returns:
+            tuple: (hour, minute) 小时和分钟
+        
+        Raises:
+            ValueError: 当时间格式不正确时
+        """
+        hour_minute = time_part.split(':')
+        if len(hour_minute) != 2:
+            raise ValueError(f"时间格式错误，应为 'HH:MM'，实际为: {time_part}")
+        
+        try:
+            hour = int(hour_minute[0])
+            minute = int(hour_minute[1])
+        except ValueError as e:
+            raise ValueError(f"时间必须为数字: {time_part}") from e
+        
+        # 验证时间范围
+        if not (0 <= hour <= 23):
+            raise ValueError(f"小时必须在 0-23 之间，实际为: {hour}")
+        if not (0 <= minute <= 59):
+            raise ValueError(f"分钟必须在 0-59 之间，实际为: {minute}")
+        
+        return hour, minute
+    
+    def parse_summary_time(self, time_str: str) -> tuple:
+        """解析自动总结时间配置
+        
+        将时间字符串（如"周一 09:00"）解析为 APScheduler 可用的格式。
+        支持完整星期名（周一到周日）和简写（一到日）。
+        
+        Args:
+            time_str: 时间字符串，格式如 "周一 09:00" 或 "一 9:00"
+        
+        Returns:
             tuple: (day_of_week, hour, minute)
+                - day_of_week (str): APScheduler 格式的星期（'mon'到'sun'）
+                - hour (int): 小时（0-23）
+                - minute (int): 分钟（0-59）
+        
+        Examples:
+            >>> parse_summary_time("周一 09:00")
+            ('mon', 9, 0)
+            >>> parse_summary_time("三 14:30")
+            ('wed', 14, 30)
+        
+        Note:
+            如果解析失败，将返回默认值 ('mon', 9, 0) 并记录警告日志
         """
         try:
-            parts = time_str.split()
-            if len(parts) != 2:
-                logger.warning(f"时间配置格式错误: {time_str}，使用默认值")
-                return 'mon', 9, 0
+            # 步骤1：解析字符串结构
+            week_day, time_part = self._parse_time_string(time_str)
             
-            week_day = parts[0]
-            time_part = parts[1]
+            # 步骤2：转换星期格式
+            day_of_week = self._parse_week_day(week_day)
             
-            # 星期映射
-            week_map = {
-                '周一': 'mon',
-                '周二': 'tue',
-                '周三': 'wed',
-                '周四': 'thu',
-                '周五': 'fri',
-                '周六': 'sat',
-                '周日': 'sun',
-                '一': 'mon',
-                '二': 'tue',
-                '三': 'wed',
-                '四': 'thu',
-                '五': 'fri',
-                '六': 'sat',
-                '日': 'sun'
-            }
+            # 步骤3：解析小时和分钟
+            hour, minute = self._parse_hour_minute(time_part)
             
-            day_of_week = week_map.get(week_day, 'mon')
-            
-            # 解析时间
-            hour_minute = time_part.split(':')
-            hour = int(hour_minute[0]) if len(hour_minute) > 0 else 9
-            minute = int(hour_minute[1]) if len(hour_minute) > 1 else 0
-            
-            logger.info(f"解析时间配置: {time_str} -> day_of_week={day_of_week}, hour={hour}, minute={minute}")
+            logger.info(f"解析时间配置: {time_str} -> "
+                       f"day_of_week={day_of_week}, hour={hour}, minute={minute}")
             return day_of_week, hour, minute
+            
         except Exception as e:
             logger.error(f"解析时间配置失败: {type(e).__name__}: {e}，使用默认值")
             return 'mon', 9, 0
@@ -409,7 +578,7 @@ class TelegramSummaryPlugin(Star):
     
     async def main_job(self):
         """主定时任务：每周一生成频道消息总结"""
-        start_time = datetime.now()
+        start_time = datetime.now(timezone.utc)
         logger.info(f"定时任务启动: {start_time}")
         
         # 检查session文件是否存在
@@ -478,7 +647,7 @@ class TelegramSummaryPlugin(Star):
             self.save_last_summary_times(self.last_summary_times)
             logger.info(f"已更新各频道的上次总结时间")
             
-            end_time = datetime.now()
+            end_time = datetime.now(timezone.utc)
             processing_time = (end_time - start_time).total_seconds()
             
             # 输出统计日志
@@ -487,7 +656,7 @@ class TelegramSummaryPlugin(Star):
                        f"已推送至 {total_push_success} 个目标（群组和用户）。失败: {total_push_fail}。")
             logger.info(f"定时任务完成: {end_time}，总处理时间: {processing_time:.2f}秒")
         except Exception as e:
-            end_time = datetime.now()
+            end_time = datetime.now(timezone.utc)
             processing_time = (end_time - start_time).total_seconds()
             logger.error(f"定时任务执行失败: {type(e).__name__}: {e}，开始时间: {start_time}，结束时间: {end_time}，处理时间: {processing_time:.2f}秒")
     
@@ -591,8 +760,8 @@ class TelegramSummaryPlugin(Star):
             
             logger.info(f"命令 {command} 执行成功")
         except Exception as e:
-            logger.error(f"执行命令 {command} 时出错: {type(e).__name__}: {e}")
-            yield event.plain_result(f"生成总结时出错: {e}")
+            logger.error(f"执行命令 {command} 时出错: {type(e).__name__}: {e}", exc_info=True)
+            yield event.plain_result("❌ 生成总结时出错，请检查日志获取详细信息")
     
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("showprompt")
@@ -613,9 +782,17 @@ class TelegramSummaryPlugin(Star):
         command = event.message_str
         logger.info(f"收到命令: {command}，发送者: {sender_id}")
         
-        # 添加用户到正在设置提示词的集合中
-        self.setting_prompt_users.add(sender_id)
-        logger.info(f"添加用户 {sender_id} 到提示词设置集合")
+        # 使用锁保护共享状态
+        async with self._setting_prompt_lock:
+            # 检查用户是否已经在设置提示词
+            if sender_id in self.setting_prompt_users:
+                yield event.plain_result("您已经在设置提示词的过程中，请先完成当前设置")
+                return
+            
+            # 添加用户到正在设置提示词的集合中
+            self.setting_prompt_users.add(sender_id)
+            logger.info(f"添加用户 {sender_id} 到提示词设置集合")
+        
         yield event.plain_result(f"请发送新的提示词，我将使用它来生成总结。\n\n当前提示词：\n{self.CURRENT_PROMPT}")
     
 
@@ -676,8 +853,8 @@ class TelegramSummaryPlugin(Star):
             # 没有提供频道URL
             yield event.plain_result("请提供有效的频道URL，例如：/addchannel https://t.me/examplechannel")
         except Exception as e:
-            logger.error(f"添加频道时出错: {type(e).__name__}: {e}")
-            yield event.plain_result(f"添加频道时出错: {e}")
+            logger.error(f"添加频道时出错: {type(e).__name__}: {e}", exc_info=True)
+            yield event.plain_result("❌ 添加频道失败，请检查输入格式和网络连接")
     
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("deletechannel")
@@ -714,8 +891,8 @@ class TelegramSummaryPlugin(Star):
             # 没有提供频道URL或频道不存在
             yield event.plain_result("请提供有效的频道URL，例如：/deletechannel https://t.me/examplechannel")
         except Exception as e:
-            logger.error(f"删除频道时出错: {type(e).__name__}: {e}")
-            yield event.plain_result(f"删除频道时出错: {e}")
+            logger.error(f"删除频道时出错: {type(e).__name__}: {e}", exc_info=True)
+            yield event.plain_result("❌ 删除频道失败，请稍后重试")
     
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("clearsummarytime")
@@ -738,8 +915,8 @@ class TelegramSummaryPlugin(Star):
             
             yield event.plain_result("所有频道的上次总结时间记录已成功清除\n\n下次总结将使用默认时间范围（过去7天）")
         except Exception as e:
-            logger.error(f"清除上次总结时间时出错: {type(e).__name__}: {e}")
-            yield event.plain_result(f"清除上次总结时间时出错: {e}")
+            logger.error(f"清除上次总结时间时出错: {type(e).__name__}: {e}", exc_info=True)
+            yield event.plain_result("❌ 清除记录失败，请检查文件权限")
     
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("tg_login")
@@ -753,13 +930,20 @@ class TelegramSummaryPlugin(Star):
         sender_id = event.get_sender_id()
         logger.info(f"用户 {sender_id} 请求进行Telegram登录")
         
-        # 初始化用户的登录状态
-        self.login_states[sender_id] = {
-            'stage': 'phone',
-            'phone': None,
-            'client': None,
-            'session_file': None
-        }
+        # 使用锁保护登录状态
+        async with self._login_states_lock:
+            # 检查用户是否已经在登录流程中
+            if sender_id in self.login_states:
+                yield event.plain_result("您已经在登录流程中，请先完成或使用 /tg_login 重新开始")
+                return
+            
+            # 初始化用户的登录状态
+            self.login_states[sender_id] = {
+                'stage': 'phone',
+                'phone': None,
+                'client': None,
+                'session_file': None
+            }
         
         # 提示用户输入手机号
         yield event.plain_result(
@@ -969,13 +1153,13 @@ class TelegramSummaryPlugin(Star):
                 del self.login_states[sender_id]
             yield event.plain_result("⏱️ 登录会话已超时，请使用 `/tg_login` 重新开始")
         except Exception as e:
-            logger.error(f"tg_login会话异常: {type(e).__name__}: {e}")
+            logger.error(f"tg_login会话异常: {type(e).__name__}: {e}", exc_info=True)
             # 清理登录状态
             if sender_id in self.login_states and self.login_states[sender_id].get('client'):
                 await self.login_states[sender_id]['client'].disconnect()
             if sender_id in self.login_states:
                 del self.login_states[sender_id]
-            yield event.plain_result(f"❌ 登录过程出错: {e}")
+            yield event.plain_result("❌ 登录过程出错，请检查网络连接和账号信息")
         finally:
             event.stop_event()
     async def terminate(self):
