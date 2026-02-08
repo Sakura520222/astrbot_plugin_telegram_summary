@@ -208,5 +208,11 @@ __marimo__/
 
 # Telegram session files
 *.session
+
+# AstrBot 插件数据目录
+data/plugin_data/astrbot_plugin_telegram_summary/
+
+# 开发文档（保留在本地）
 Astrbot插件开发文档.md
 .trae/
+AstrBot插件开发文档 .md
