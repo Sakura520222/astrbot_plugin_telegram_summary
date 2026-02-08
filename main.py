@@ -12,7 +12,7 @@ from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 
-@register("telegram_summary", "Sakura520222", "一个 Telegram 频道消息总结插件，每周自动生成指定频道的消息汇总报告，支持自动推送到QQ群组和用户。", "1.2.0", "https://github.com/Sakura520222/astrbot_plugin_telegram_summary")
+@register("telegram_summary", "Sakura520222", "一个 Telegram 频道消息总结插件，每周自动生成指定频道的消息汇总报告，支持自动推送到QQ群组和用户。", "1.2.1", "https://github.com/Sakura520222/astrbot_plugin_telegram_summary")
 class TelegramSummaryPlugin(Star):
     """Telegram 频道消息总结插件
     
@@ -95,14 +95,14 @@ class TelegramSummaryPlugin(Star):
         self._setup_scheduler()
     
     def _init_data_directory(self):
-        """初始化数据目录"""
-        # 使用传统方式获取数据目录
-        # 插件数据目录位于 data/plugin_data/{插件名}/
-        # __file__ = AstrBot/data/plugins/astrbot_plugin_telegram_summary/main.py
-        # 所以需要向上2级到 data/，然后进入 plugin_data/
-        from pathlib import Path
-        plugin_data_dir = Path(__file__).parent.parent.parent / 'plugin_data' / 'astrbot_plugin_telegram_summary'
-        self.data_dir = plugin_data_dir
+        """初始化数据目录
+        
+        使用 AstrBot 框架提供的 StarTools 获取标准的数据存储目录。
+        这是框架推荐的数据持久化方式，能够确保插件在不同环境下
+        都能正确访问数据目录。
+        """
+        # 使用 StarTools 获取数据目录（框架标准方式）
+        self.data_dir = StarTools.get_data_dir("astrbot_plugin_telegram_summary")
         self.data_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"数据目录已准备: {self.data_dir}")
     
@@ -430,9 +430,16 @@ class TelegramSummaryPlugin(Star):
                 self.admin_id = None
     
     def _init_concurrent_safety(self):
-        """初始化并发安全机制"""
+        """初始化并发安全机制
+        
+        添加多个锁以保护关键资源：
+        - _setting_prompt_lock: 保护提示词设置流程
+        - _login_states_lock: 保护登录状态
+        - _telegram_client_lock: 保护 Telegram Client 实例，防止 session 文件并发冲突
+        """
         self._setting_prompt_lock = asyncio.Lock()
         self._login_states_lock = asyncio.Lock()
+        self._telegram_client_lock = asyncio.Lock()  # 新增：防止 Telegram Client 并发冲突
         logger.debug("并发安全锁已初始化")
     
     def _init_runtime_state(self):
@@ -819,6 +826,8 @@ class TelegramSummaryPlugin(Star):
     async def fetch_last_week_messages(self, channels_to_fetch=None):
         """抓取从上次总结时间至今的频道消息
         
+        使用锁机制确保不会与登录流程中的 Telegram Client 发生并发冲突。
+        
         Args:
             channels_to_fetch: 可选，要抓取的频道列表。如果为None，则抓取所有配置的频道。
         
@@ -828,74 +837,75 @@ class TelegramSummaryPlugin(Star):
         Raises:
             Exception: 网络中断、认证失败等异常会向上传播
         """
-        # 确保 API_ID 是整数
-        logger.info("开始抓取频道消息")
-        
-        try:
-            async with TelegramClient(self.USER_SESSION_FILE, int(self.API_ID), self.API_HASH) as client:
-                current_time = datetime.now(timezone.utc)
-                
-                messages_by_channel = {}  # 按频道分组的消息字典
-                
-                # 确定要抓取的频道
-                if channels_to_fetch and isinstance(channels_to_fetch, list):
-                    # 只抓取指定的频道
-                    channels = channels_to_fetch
-                    logger.info(f"正在抓取指定的 {len(channels)} 个频道的消息")
-                else:
-                    # 抓取所有配置的频道
-                    if not self.CHANNELS:
-                        logger.warning("没有配置任何频道，无法抓取消息")
-                        return messages_by_channel
-                    channels = self.CHANNELS
-                    logger.info(f"正在抓取所有 {len(channels)} 个频道的消息")
-                
-                total_message_count = 0
-                
-                # 遍历所有要抓取的频道
-                for channel in channels:
-                    channel_messages = []
-                    channel_message_count = 0
-                    logger.info(f"开始抓取频道: {channel}")
+        # 使用锁防止与登录流程中的 Client 发生 session 文件冲突
+        async with self._telegram_client_lock:
+            logger.info("开始抓取频道消息（已获取 Telegram Client 锁）")
+            
+            try:
+                async with TelegramClient(self.USER_SESSION_FILE, int(self.API_ID), self.API_HASH) as client:
+                    current_time = datetime.now(timezone.utc)
                     
-                    try:
-                        # 为每个频道确定独立的起始时间
-                        if channel in self.last_summary_times and self.last_summary_times[channel]:
-                            start_time = self.last_summary_times[channel]
-                            logger.info(f"频道 {channel} 使用上次总结时间作为起始时间: {start_time}")
-                        else:
-                            start_time = current_time - timedelta(days=self.DEFAULT_SUMMARY_DAYS)
-                            logger.info(f"频道 {channel} 没有上次总结时间，使用默认时间范围: 过去{self.DEFAULT_SUMMARY_DAYS}天 ({start_time})")
-                        
-                        # 异步迭代消息，添加网络中断保护
-                        async for message in client.iter_messages(channel, offset_date=start_time, reverse=True):
-                            total_message_count += 1
-                            channel_message_count += 1
-                            if message.text:
-                                # 动态获取频道名用于生成链接
-                                channel_part = self._extract_channel_name(channel)
-                                msg_link = f"{self.TELEGRAM_URL_PREFIX}{channel_part}/{message.id}"
-                                channel_messages.append(f"内容: {message.text[:self.MESSAGE_TRUNCATE_LENGTH]}\n链接: {msg_link}")
-                                
-                                # 每抓取10条消息记录一次日志
-                                if len(channel_messages) % 10 == 0:
-                                    logger.debug(f"频道 {channel} 已抓取 {len(channel_messages)} 条有效消息")
+                    messages_by_channel = {}  # 按频道分组的消息字典
                     
-                    except Exception as channel_error:
-                        logger.error(f"抓取频道 {channel} 时出错: {type(channel_error).__name__}: {channel_error}")
-                        # 继续处理其他频道，不中断整个流程
+                    # 确定要抓取的频道
+                    if channels_to_fetch and isinstance(channels_to_fetch, list):
+                        # 只抓取指定的频道
+                        channels = channels_to_fetch
+                        logger.info(f"正在抓取指定的 {len(channels)} 个频道的消息")
+                    else:
+                        # 抓取所有配置的频道
+                        if not self.CHANNELS:
+                            logger.warning("没有配置任何频道，无法抓取消息")
+                            return messages_by_channel
+                        channels = self.CHANNELS
+                        logger.info(f"正在抓取所有 {len(channels)} 个频道的消息")
+                    
+                    total_message_count = 0
+                    
+                    # 遍历所有要抓取的频道
+                    for channel in channels:
                         channel_messages = []
+                        channel_message_count = 0
+                        logger.info(f"开始抓取频道: {channel}")
+                        
+                        try:
+                            # 为每个频道确定独立的起始时间
+                            if channel in self.last_summary_times and self.last_summary_times[channel]:
+                                start_time = self.last_summary_times[channel]
+                                logger.info(f"频道 {channel} 使用上次总结时间作为起始时间: {start_time}")
+                            else:
+                                start_time = current_time - timedelta(days=self.DEFAULT_SUMMARY_DAYS)
+                                logger.info(f"频道 {channel} 没有上次总结时间，使用默认时间范围: 过去{self.DEFAULT_SUMMARY_DAYS}天 ({start_time})")
+                            
+                            # 异步迭代消息，添加网络中断保护
+                            async for message in client.iter_messages(channel, offset_date=start_time, reverse=True):
+                                total_message_count += 1
+                                channel_message_count += 1
+                                if message.text:
+                                    # 动态获取频道名用于生成链接
+                                    channel_part = self._extract_channel_name(channel)
+                                    msg_link = f"{self.TELEGRAM_URL_PREFIX}{channel_part}/{message.id}"
+                                    channel_messages.append(f"内容: {message.text[:self.MESSAGE_TRUNCATE_LENGTH]}\n链接: {msg_link}")
+                                    
+                                    # 每抓取10条消息记录一次日志
+                                    if len(channel_messages) % 10 == 0:
+                                        logger.debug(f"频道 {channel} 已抓取 {len(channel_messages)} 条有效消息")
+                        
+                        except Exception as channel_error:
+                            logger.error(f"抓取频道 {channel} 时出错: {type(channel_error).__name__}: {channel_error}")
+                            # 继续处理其他频道，不中断整个流程
+                            channel_messages = []
+                        
+                        # 将当前频道的消息添加到字典中
+                        messages_by_channel[channel] = channel_messages
+                        logger.info(f"频道 {channel} 抓取完成，共处理 {channel_message_count} 条消息，其中 {len(channel_messages)} 条包含文本内容")
                     
-                    # 将当前频道的消息添加到字典中
-                    messages_by_channel[channel] = channel_messages
-                    logger.info(f"频道 {channel} 抓取完成，共处理 {channel_message_count} 条消息，其中 {len(channel_messages)} 条包含文本内容")
-                
-                logger.info(f"所有指定频道消息抓取完成，共处理 {total_message_count} 条消息")
-                return messages_by_channel
-        
-        except Exception as e:
-            logger.error(f"Telegram客户端连接失败: {type(e).__name__}: {e}")
-            raise Exception(f"无法连接到Telegram: 请检查网络连接和登录状态") from e
+                    logger.info(f"所有指定频道消息抓取完成，共处理 {total_message_count} 条消息")
+                    return messages_by_channel
+            
+            except Exception as e:
+                logger.error(f"Telegram客户端连接失败: {type(e).__name__}: {e}")
+                raise Exception(f"无法连接到Telegram: 请检查网络连接和登录状态") from e
     
     async def analyze_with_ai(self, messages):
         """调用 AI 进行总结"""
