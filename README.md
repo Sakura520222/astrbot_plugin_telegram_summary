@@ -1,5 +1,7 @@
 # Telegram 频道消息总结插件
 
+> **当前版本：v1.2.0** | [更新日志](CHANGELOG.md)
+
 本插件转自我的另一个项目：[Sakura-Channel-Summary-Assistant](https://github.com/Sakura520222/Sakura-Channel-Summary-Assistant)
 
 一个适用于AstrBot的 Telegram 频道消息总结插件，每周自动生成指定频道的消息汇总报告，支持自动推送到QQ群组和用户。

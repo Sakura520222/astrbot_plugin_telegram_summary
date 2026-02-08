@@ -53,5 +53,34 @@
     "type": "list",
     "default": [],
     "hint": "填写用户ID即可，每行一个。"
+  },
+  "admin_id": {
+    "description": "管理员QQ号",
+    "type": "string",
+    "hint": "用于接收插件异常告警通知"
+  },
+  "message_templates": {
+    "description": "消息模板配置",
+    "type": "object",
+    "items": {
+      "summary_title": {
+        "description": "总结报告标题模板",
+        "type": "string",
+        "default": "【频道周报】{channel_name}",
+        "hint": "可用变量: {channel_name} - 频道名称"
+      },
+      "summary_footer": {
+        "description": "总结报告底部模板",
+        "type": "text",
+        "default": "",
+        "hint": "追加在总结内容后面的文本，留空则不添加"
+      },
+      "alert_title": {
+        "description": "告警消息标题模板",
+        "type": "string",
+        "default": "🚨 **插件告警通知**",
+        "hint": "告警消息的标题"
+      }
+    }
   }
 }

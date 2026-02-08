@@ -12,7 +12,7 @@ from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 
-@register("telegram_summary", "Sakura520222", "一个 Telegram 频道消息总结插件，每周自动生成指定频道的消息汇总报告，支持自动推送到QQ群组和用户。", "1.1.0", "https://github.com/Sakura520222/astrbot_plugin_telegram_summary")
+@register("telegram_summary", "Sakura520222", "一个 Telegram 频道消息总结插件，每周自动生成指定频道的消息汇总报告，支持自动推送到QQ群组和用户。", "1.2.0", "https://github.com/Sakura520222/astrbot_plugin_telegram_summary")
 class TelegramSummaryPlugin(Star):
     """Telegram 频道消息总结插件
     
@@ -21,16 +21,59 @@ class TelegramSummaryPlugin(Star):
     """
     
     # 类常量定义
-    DEFAULT_SUMMARY_DAYS = 7  # 默认总结时间范围（天）
-    SESSION_TIMEOUT = 120  # 登录会话超时时间（秒）
-    MESSAGE_TRUNCATE_LENGTH = 500  # 消息截断长度
-    PUSH_DELAY_MIN = 1  # 推送延迟最小值（秒）
-    PUSH_DELAY_MAX = 3  # 推送延迟最大值（秒）
-    PROTOCOL_PREFIX_QQ_GROUP = "QQ:GroupMessage:"
-    PROTOCOL_PREFIX_QQ_FRIEND = "QQ:FriendMessage:"
-    TELEGRAM_URL_PREFIX = "https://t.me/"
     
-    DEFAULT_AUTO_SUMMARY_TIME = "周一 09:00"
+    # 配置相关常量
+    DEFAULT_SUMMARY_DAYS: int = 7
+    """默认总结时间范围（天）
+    
+    当频道首次进行总结或上次总结时间记录丢失时，
+    使用此值作为默认的抓取时间范围。
+    """
+    
+    SESSION_TIMEOUT: int = 120
+    """登录会话超时时间（秒）
+    
+    Telegram 登录流程（包括手机号、验证码、密码输入）
+    的最大等待时间。超时后需要重新开始登录流程。
+    """
+    
+    MESSAGE_TRUNCATE_LENGTH: int = 500
+    """消息截断长度（字符数）
+    
+    为了控制 AI 输入长度和 token 消耗，
+    每条 Telegram 消息文本超过此长度时将被截断。
+    """
+    
+    # 推送相关常量
+    PUSH_DELAY_MIN: int = 1
+    """推送延迟最小值（秒）
+    
+    向多个目标推送总结消息时，
+    每次推送之间的最小延迟时间，用于避免触发频率限制。
+    """
+    
+    PUSH_DELAY_MAX: int = 3
+    """推送延迟最大值（秒）
+    
+    向多个目标推送总结消息时，
+    每次推送之间的最大延迟时间，用于避免触发频率限制。
+    实际延迟时间将在 PUSH_DELAY_MIN 和 PUSH_DELAY_MAX 之间随机选择。
+    """
+    
+    # URL 相关常量
+    TELEGRAM_URL_PREFIX: str = "https://t.me/"
+    """Telegram 频道 URL 前缀
+    
+    用于构建 Telegram 频道消息链接的 URL 前缀。
+    示例：https://t.me/channel_name/12345
+    """
+    
+    DEFAULT_AUTO_SUMMARY_TIME: str = "周一 09:00"
+    """默认自动总结时间配置
+    
+    默认的定时任务执行时间，格式为"星期 时间"。
+    可以在插件配置中修改此值。
+    """
     
     def __init__(self, context: Context, config: AstrBotConfig):
         """初始化插件
@@ -53,8 +96,13 @@ class TelegramSummaryPlugin(Star):
     
     def _init_data_directory(self):
         """初始化数据目录"""
-        # 使用框架提供的规范方法获取数据目录
-        self.data_dir = StarTools.get_data_dir()
+        # 使用传统方式获取数据目录
+        # 插件数据目录位于 data/plugin_data/{插件名}/
+        # __file__ = AstrBot/data/plugins/astrbot_plugin_telegram_summary/main.py
+        # 所以需要向上2级到 data/，然后进入 plugin_data/
+        from pathlib import Path
+        plugin_data_dir = Path(__file__).parent.parent.parent / 'plugin_data' / 'astrbot_plugin_telegram_summary'
+        self.data_dir = plugin_data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"数据目录已准备: {self.data_dir}")
     
@@ -70,6 +118,31 @@ class TelegramSummaryPlugin(Star):
                     f"配置={self.CONFIG_FILE}, "
                     f"上次总结={self.LAST_SUMMARY_FILE}, "
                     f"会话={self.USER_SESSION_FILE}")
+        
+        # 检查并设置 session 文件权限
+        self._ensure_session_file_security()
+    
+    def _ensure_session_file_security(self):
+        """确保 session 文件的安全性
+        
+        检查 session 文件权限，确保只有文件所有者可以读写。
+        在 Windows 上，chmod 的功能受限，但仍会尝试设置。
+        """
+        session_file = Path(self.USER_SESSION_FILE)
+        
+        if session_file.exists():
+            try:
+                # 尝试设置文件权限为 600 (仅所有者可读写)
+                # Windows: 设置为只读属性
+                # Unix/Linux: 设置为 rw-------
+                import stat
+                os.chmod(self.USER_SESSION_FILE, 0o600)
+                logger.debug(f"已设置 session 文件权限: {self.USER_SESSION_FILE}")
+            except Exception as e:
+                logger.warning(
+                    f"无法设置 session 文件权限: {type(e).__name__}: {e}\n"
+                    "建议手动检查文件权限，确保只有所有者可以访问"
+                )
     
     def _init_constants(self):
         """初始化常量配置"""
@@ -100,34 +173,261 @@ class TelegramSummaryPlugin(Star):
         
         Args:
             config: AstrBot 配置对象
+        
+        Raises:
+            ValueError: 当配置验证失败时
         """
         logger.info("开始从 AstrBot 配置系统加载配置...")
         
-        # Telegram 配置
+        # Telegram 配置（带验证）
         telegram_config = config.get('telegram', {})
-        self.API_ID = telegram_config.get('api_id')
-        self.API_HASH = telegram_config.get('api_hash')
+        self.API_ID = self._validate_api_id(telegram_config.get('api_id'))
+        self.API_HASH = self._validate_api_hash(telegram_config.get('api_hash'))
         
-        # 频道配置
-        self.CHANNELS = config.get('channels', [])
+        # 频道配置（带验证）
+        self.CHANNELS = self._validate_channels(config.get('channels', []))
         logger.info(f"已加载频道列表: {self.CHANNELS}")
         
         # 提示词配置
         self.CURRENT_PROMPT = config.get('prompt', self.DEFAULT_PROMPT)
         logger.info("已加载提示词配置")
         
-        # AI 提供商配置
-        self.ai_provider = config.get('select_provider')
+        # AI 提供商配置（带验证）
+        self.ai_provider = self._validate_ai_provider(config.get('select_provider'))
         logger.info(f"已加载AI提供商: {self.ai_provider}")
         
-        # 自动总结时间配置
-        self.auto_summary_time = config.get('auto_summary_time', self.DEFAULT_AUTO_SUMMARY_TIME)
+        # 自动总结时间配置（带验证）
+        self.auto_summary_time = self._validate_summary_time(
+            config.get('auto_summary_time', self.DEFAULT_AUTO_SUMMARY_TIME)
+        )
         logger.info(f"已加载自动总结时间: {self.auto_summary_time}")
+        
+        # 管理员配置（用于告警）
+        self.admin_id = config.get('admin_id')
+        if self.admin_id:
+            logger.info(f"已配置管理员ID: {self.admin_id}")
         
         # 自动推送目标配置
         self.auto_push_groups = config.get('auto_push_groups', [])
         self.auto_push_users = config.get('auto_push_users', [])
+        
+        # 验证推送目标格式
+        self._validate_push_targets()
+        
         logger.info(f"已加载推送目标: 群组 {len(self.auto_push_groups)} 个, 用户 {len(self.auto_push_users)} 个")
+        
+        # 消息模板配置
+        self.message_templates = config.get('message_templates', {})
+        logger.info(f"已加载消息模板配置: {len(self.message_templates)} 项")
+    
+    def _validate_api_id(self, api_id) -> int:
+        """验证 Telegram API ID
+        
+        Args:
+            api_id: API ID 配置值
+        
+        Returns:
+            int: 验证后的 API ID
+        
+        Raises:
+            ValueError: 当 API ID 无效时
+        """
+        if api_id is None:
+            raise ValueError(
+                "Telegram API ID 未配置。\n"
+                "请在插件配置中设置 'telegram.api_id'。\n"
+                "获取方式：访问 https://my.telegram.org/apps"
+            )
+        
+        try:
+            api_id_int = int(api_id)
+            if api_id_int <= 0:
+                raise ValueError("API ID 必须为正整数")
+            return api_id_int
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"Telegram API ID 格式错误: {api_id}\n"
+                f"API ID 必须是整数，当前值: {type(api_id).__name__}\n"
+                "获取方式：访问 https://my.telegram.org/apps"
+            ) from e
+    
+    def _validate_api_hash(self, api_hash) -> str:
+        """验证 Telegram API Hash
+        
+        Args:
+            api_hash: API Hash 配置值
+        
+        Returns:
+            str: 验证后的 API Hash
+        
+        Raises:
+            ValueError: 当 API Hash 无效时
+        """
+        if api_hash is None:
+            raise ValueError(
+                "Telegram API Hash 未配置。\n"
+                "请在插件配置中设置 'telegram.api_hash'。\n"
+                "获取方式：访问 https://my.telegram.org/apps"
+            )
+        
+        if not isinstance(api_hash, str):
+            raise ValueError(
+                f"Telegram API Hash 必须是字符串，当前值: {type(api_hash).__name__}"
+            )
+        
+        # API Hash 通常是 32 个十六进制字符
+        api_hash_clean = api_hash.strip()
+        if len(api_hash_clean) != 32:
+            logger.warning(
+                f"API Hash 长度异常（应为32字符）: {len(api_hash_clean)} 字符。"
+                "请检查配置是否正确。"
+            )
+        
+        try:
+            # 验证是否为有效的十六进制字符串
+            int(api_hash_clean, 16)
+            return api_hash_clean
+        except ValueError:
+            raise ValueError(
+                f"Telegram API Hash 格式错误，应为32位十六进制字符串\n"
+                f"当前值长度: {len(api_hash_clean)} 字符\n"
+                "获取方式：访问 https://my.telegram.org/apps"
+            )
+    
+    def _validate_channels(self, channels) -> list:
+        """验证频道配置
+        
+        Args:
+            channels: 频道列表配置
+        
+        Returns:
+            list: 验证后的频道列表
+        
+        Raises:
+            ValueError: 当频道配置无效时
+        """
+        if not channels:
+            raise ValueError(
+                "未配置任何频道。\n"
+                "请在插件配置中添加 'channels' 列表。\n"
+                "示例：['https://t.me/channel1', 'https://t.me/channel2']"
+            )
+        
+        if not isinstance(channels, list):
+            raise ValueError(
+                f"频道配置必须是列表格式，当前类型: {type(channels).__name__}"
+            )
+        
+        validated_channels = []
+        for channel in channels:
+            if not isinstance(channel, str):
+                logger.warning(f"跳过非字符串频道配置: {channel} (类型: {type(channel).__name__})")
+                continue
+            
+            channel = channel.strip()
+            if not channel:
+                logger.warning("跳过空频道配置")
+                continue
+            
+            # 基本格式验证
+            if channel.startswith('http'):
+                if not ('t.me/' in channel or 'telegram.me/' in channel):
+                    logger.warning(f"频道URL格式可能不正确: {channel}")
+            validated_channels.append(channel)
+        
+        if not validated_channels:
+            raise ValueError(
+                "频道列表为空或所有频道配置均无效。\n"
+                "请检查配置格式是否正确。"
+            )
+        
+        return validated_channels
+    
+    def _validate_ai_provider(self, provider):
+        """验证 AI 提供商配置
+        
+        Args:
+            provider: AI 提供商配置值
+        
+        Returns:
+            str: 验证后的提供商名称
+        
+        Raises:
+            ValueError: 当提供商配置无效时
+        """
+        if provider is None:
+            raise ValueError(
+                "未配置 AI 提供商。\n"
+                "请在插件配置中设置 'select_provider'。\n"
+                "可选值: 查看您的 AI 提供商列表"
+            )
+        
+        if not isinstance(provider, str) or not provider.strip():
+            raise ValueError(
+                f"AI 提供商配置必须是非空字符串，当前值: {provider}"
+            )
+        
+        return provider.strip()
+    
+    def _validate_summary_time(self, time_str: str) -> str:
+        """验证自动总结时间配置
+        
+        Args:
+            time_str: 时间字符串
+        
+        Returns:
+            str: 验证后的时间字符串
+        """
+        try:
+            # 尝试解析时间配置
+            self.parse_summary_time(time_str)
+            return time_str
+        except Exception as e:
+            logger.warning(
+                f"自动总结时间配置无效: {time_str}，使用默认值: {self.DEFAULT_AUTO_SUMMARY_TIME}\n"
+                f"错误原因: {e}"
+            )
+            return self.DEFAULT_AUTO_SUMMARY_TIME
+    
+    def _validate_push_targets(self):
+        """验证推送目标配置
+        
+        检查推送目标的格式是否正确
+        """
+        # 验证群组ID格式
+        if not isinstance(self.auto_push_groups, list):
+            logger.warning("auto_push_groups 配置必须是列表，已重置为空列表")
+            self.auto_push_groups = []
+        
+        validated_groups = []
+        for group_id in self.auto_push_groups:
+            if isinstance(group_id, (int, str)):
+                validated_groups.append(str(group_id))
+            else:
+                logger.warning(f"跳过无效的群组ID: {group_id}")
+        self.auto_push_groups = validated_groups
+        
+        # 验证用户ID格式
+        if not isinstance(self.auto_push_users, list):
+            logger.warning("auto_push_users 配置必须是列表，已重置为空列表")
+            self.auto_push_users = []
+        
+        validated_users = []
+        for user_id in self.auto_push_users:
+            if isinstance(user_id, (int, str)):
+                validated_users.append(str(user_id))
+            else:
+                logger.warning(f"跳过无效的用户ID: {user_id}")
+        self.auto_push_users = validated_users
+        
+        # 验证管理员ID格式
+        if self.admin_id is not None:
+            if isinstance(self.admin_id, (int, str)):
+                self.admin_id = str(self.admin_id)
+                logger.info(f"管理员ID已验证: {self.admin_id}")
+            else:
+                logger.warning(f"管理员ID格式无效: {self.admin_id}，已忽略")
+                self.admin_id = None
     
     def _init_concurrent_safety(self):
         """初始化并发安全机制"""
@@ -173,20 +473,251 @@ class TelegramSummaryPlugin(Star):
         
         Returns:
             bool: 是否匹配
+        
+        Examples:
+            >>> _match_channel("channel_name", "https://t.me/channel_name")
+            True
+            >>> _match_channel("https://t.me/channel_name", "channel_name")
+            True
+            >>> _match_channel("https://t.me/channel_name", "https://t.me/channel_name")
+            True
         """
         # 提取频道名称
         config_channel_name = self._extract_channel_name(config_channel)
         user_channel_name = self._extract_channel_name(user_input)
         
-        # 匹配逻辑（双向匹配）
+        # 构建配置频道的所有可能标识符（使用集合提高查找效率）
+        config_identifiers = {
+            config_channel,  # 原始配置（可能是URL或频道名）
+            config_channel_name  # 提取后的频道名
+        }
+        
+        # 如果配置是URL，添加URL格式
+        if not config_channel.startswith('http'):
+            config_identifiers.add(f"{self.TELEGRAM_URL_PREFIX}{config_channel}")
+        
+        # 检查用户输入的任何形式是否匹配配置的标识符
         return (
-            user_input == config_channel or  # 完全相同
-            user_input == config_channel_name or  # 用户输入的是频道名，配置也是频道名
-            user_channel_name == config_channel_name or  # 提取后的频道名相同
-            (not user_input.startswith('http') and f"{self.TELEGRAM_URL_PREFIX}{user_input}" == config_channel) or  # 频道名 -> URL
-            (not config_channel.startswith('http') and f"{self.TELEGRAM_URL_PREFIX}{config_channel}" == user_input) or  # 频道名 <- URL
-            (user_input.startswith('http') and config_channel.startswith('http') and user_input == config_channel)  # 两个都是URL
+            user_input in config_identifiers or  # 直接匹配
+            user_channel_name in config_identifiers  # 提取后的频道名匹配
         )
+    
+    def _init_login_state(self, sender_id: str) -> bool:
+        """初始化用户登录状态
+        
+        Args:
+            sender_id: 用户ID
+        
+        Returns:
+            bool: 是否成功初始化（False表示用户已在登录流程中）
+        """
+        if sender_id in self.login_states:
+            return False
+        
+        self.login_states[sender_id] = {
+            'stage': 'phone',
+            'phone': None,
+            'client': None,
+            'session_file': None
+        }
+        return True
+    
+    async def _cleanup_login_session(self, sender_id: str):
+        """清理登录会话资源
+        
+        Args:
+            sender_id: 用户ID
+        """
+        if sender_id in self.login_states and self.login_states[sender_id].get('client'):
+            try:
+                await self.login_states[sender_id]['client'].disconnect()
+            except Exception as e:
+                logger.warning(f"断开Telegram客户端时出错: {type(e).__name__}: {e}")
+        
+        if sender_id in self.login_states:
+            del self.login_states[sender_id]
+    
+    async def _handle_phone_stage(self, event, user_input: str, login_state: dict, sender_id: str):
+        """处理登录流程的手机号输入阶段
+        
+        Args:
+            event: 消息事件对象
+            user_input: 用户输入的手机号
+            login_state: 登录状态字典
+            sender_id: 用户ID
+        
+        Returns:
+            tuple: (success, should_stop) success表示是否成功，should_stop表示是否停止会话
+        """
+        # 验证手机号格式
+        if not user_input.startswith('+'):
+            await event.send(event.plain_result(
+                "❌ **手机号格式错误**\n\n"
+                "手机号必须以 `+` 开头（包含国家代码）\n"
+                "正确示例：`+8613812345678`\n\n"
+                "请重新输入手机号，或发送 `退出` 取消登录"
+            ))
+            return False, False
+        
+        phone = user_input
+        logger.info(f"用户 {sender_id} 输入手机号: {phone}")
+        
+        # 提示正在连接
+        await event.send(event.plain_result("📡 正在连接到 Telegram 服务器并请求验证码..."))
+        
+        try:
+            # 创建Telegram客户端（使用固定的session文件）
+            session_file = self.USER_SESSION_FILE
+            api_id = int(self.API_ID)
+            
+            client = TelegramClient(session_file, api_id, self.API_HASH)
+            await client.connect()
+            
+            logger.info(f"为用户 {sender_id} 创建Telegram客户端，会话文件: {session_file}")
+            
+            # 发送验证码
+            await client.send_code_request(phone)
+            
+            logger.info(f"验证码已发送到用户 {sender_id} 的手机/Telegram应用")
+            
+            # 更新登录状态
+            login_state['stage'] = 'code'
+            login_state['phone'] = phone
+            login_state['client'] = client
+            login_state['session_file'] = session_file
+            
+            # 提示用户输入验证码
+            await event.send(event.plain_result(
+                "📩 **验证码已发送**\n\n"
+                "验证码已发送到您的 Telegram 应用或短信\n"
+                "请输入您收到的验证码\n\n"
+                "⏱️ 会话将在 120 秒后超时，或发送 `退出` 取消登录"
+            ))
+            
+            return True, False
+            
+        except Exception as e:
+            logger.error(f"发送验证码失败: {type(e).__name__}: {e}")
+            await event.send(event.plain_result(
+                f"❌ **发送验证码失败**\n\n"
+                f"错误：{e}\n\n"
+                "请检查手机号和网络连接后重试"
+            ))
+            await self._cleanup_login_session(sender_id)
+            return False, True
+    
+    async def _handle_code_stage(self, event, user_input: str, login_state: dict, sender_id: str):
+        """处理登录流程的验证码输入阶段
+        
+        Args:
+            event: 消息事件对象
+            user_input: 用户输入的验证码
+            login_state: 登录状态字典
+            sender_id: 用户ID
+        
+        Returns:
+            tuple: (success, should_stop) success表示是否成功，should_stop表示是否停止会话
+        """
+        code = user_input
+        phone = login_state['phone']
+        client = login_state['client']
+        
+        logger.info(f"用户 {sender_id} 输入验证码")
+        
+        try:
+            # 尝试使用验证码登录
+            await client.sign_in(phone, code)
+            
+            logger.info(f"用户 {sender_id} Telegram登录成功（无两步验证）")
+            
+            await event.send(event.plain_result(
+                "✅ **登录成功！**\n\n"
+                "您的 Telegram 账号已成功登录\n"
+                "Session 已保存，后续将自动使用此账号"
+            ))
+            
+            # 保持连接一小段时间确保session正确保存
+            await asyncio.sleep(2)
+            await self._cleanup_login_session(sender_id)
+            return True, True
+            
+        except Exception as password_error:
+            error_msg = str(password_error)
+            logger.info(f"用户 {sender_id} 登录时需要两步验证: {error_msg}")
+            
+            # 检查是否是两步验证错误
+            if "SessionPasswordNeededError" in error_msg or ("verification" in error_msg.lower() and "password" in error_msg.lower()):
+                # 更新登录状态
+                login_state['stage'] = 'password'
+                
+                # 提示用户输入密码
+                await event.send(event.plain_result(
+                    "🔐 **检测到两步验证**\n\n"
+                    "您的账号启用了两步验证（云密码）\n"
+                    "请输入您的两步验证密码\n\n"
+                    "⚠️ **安全提示**：输入密码后建议手动撤回该消息\n"
+                    "⏱️ 会话将在 120 秒后超时，或发送 `退出` 取消登录"
+                ))
+                
+                return False, False
+            else:
+                # 其他类型的错误
+                logger.error(f"用户 {sender_id} 验证码登录失败: {password_error}")
+                await event.send(event.plain_result(
+                    "❌ **登录失败**\n\n"
+                    f"错误信息：{password_error}\n"
+                    "可能的原因：\n"
+                    "• 验证码错误或已过期\n"
+                    "• 手机号格式不正确\n"
+                    "• 网络连接问题\n\n"
+                    "请使用 `/tg_login` 重新开始"
+                ))
+                await self._cleanup_login_session(sender_id)
+                return False, True
+    
+    async def _handle_password_stage(self, event, user_input: str, login_state: dict, sender_id: str):
+        """处理登录流程的两步验证密码输入阶段
+        
+        Args:
+            event: 消息事件对象
+            user_input: 用户输入的密码
+            login_state: 登录状态字典
+            sender_id: 用户ID
+        
+        Returns:
+            tuple: (success, should_stop) success表示是否成功，should_stop表示是否停止会话
+        """
+        password = user_input
+        client = login_state['client']
+        
+        logger.debug(f"用户 {sender_id} 输入两步验证密码")  # 使用 debug 级别避免敏感信息泄露
+        
+        try:
+            # 使用密码登录
+            await client.sign_in(password=password)
+            
+            logger.info(f"用户 {sender_id} Telegram登录成功（使用两步验证）")
+            
+            await event.send(event.plain_result(
+                "✅ **登录成功！**\n\n"
+                "您的 Telegram 账号已成功登录\n"
+                "Session 已保存，后续将自动使用此账号"
+            ))
+            
+            # 保持连接一小段时间确保session正确保存
+            await asyncio.sleep(2)
+            await self._cleanup_login_session(sender_id)
+            return True, True
+            
+        except Exception as pwd_error:
+            logger.error(f"用户 {sender_id} 两步验证密码错误: {pwd_error}")
+            await event.send(event.plain_result(
+                "❌ **两步验证密码错误**\n\n"
+                f"登录失败：{pwd_error}\n\n"
+                "请检查密码后重试，使用 `/tg_login` 重新开始"
+            ))
+            await self._cleanup_login_session(sender_id)
+            return False, True
     
     def load_prompt(self):
         """从文件中读取提示词，如果文件不存在则使用默认提示词"""
@@ -444,6 +975,61 @@ class TelegramSummaryPlugin(Star):
         }
         return week_map.get(week_day, 'mon')
     
+    async def _send_admin_alert(self, task_name: str, error: Exception, context: dict = None):
+        """向管理员发送告警消息
+        
+        Args:
+            task_name: 任务名称
+            error: 异常对象
+            context: 额外的上下文信息（可选）
+        """
+        if not self.admin_id:
+            logger.warning("未配置管理员ID，无法发送告警")
+            return
+        
+        try:
+            from astrbot.api.event import MessageChain
+            
+            # 构建告警消息
+            error_type = type(error).__name__
+            error_msg = str(error)
+            error_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            
+            alert_message = (
+                f"🚨 **插件告警通知**\n\n"
+                f"任务名称: {task_name}\n"
+                f"错误类型: {error_type}\n"
+                f"发生时间: {error_time}\n"
+            )
+            
+            # 添加错误摘要（限制长度）
+            if error_msg:
+                error_summary = error_msg[:500]
+                if len(error_msg) > 500:
+                    error_summary += "..."
+                alert_message += f"错误摘要: {error_summary}\n"
+            
+            # 添加额外上下文
+            if context:
+                alert_message += "\n**详细信息:**\n"
+                for key, value in context.items():
+                    if value is not None:
+                        alert_message += f"- {key}: {value}\n"
+            
+            alert_message += "\n请检查日志获取详细信息"
+            
+            # 构建消息链
+            message_chain = MessageChain().message(alert_message)
+            
+            # 发送告警
+            admin_umo = f"QQ:FriendMessage:{self.admin_id}"
+            await self.context.send_message(admin_umo, message_chain)
+            
+            logger.info(f"已向管理员 {self.admin_id} 发送告警: {task_name} - {error_type}")
+            
+        except Exception as e:
+            logger.error(f"发送管理员告警失败: {type(e).__name__}: {e}")
+    
     def _parse_hour_minute(self, time_part: str) -> tuple:
         """解析时间部分为小时和分钟
         
@@ -537,8 +1123,17 @@ class TelegramSummaryPlugin(Star):
             logger.info("未配置推送目标，跳过推送")
             return {'success': 0, 'fail': 0}
         
-        # 构建推送消息
-        push_message = f"【频道周报】{channel_name}\n\n{summary_text}"
+        # 使用配置的消息模板构建推送消息
+        title_template = self.message_templates.get('summary_title', '【频道周报】{channel_name}')
+        footer_template = self.message_templates.get('summary_footer', '')
+        
+        # 格式化标题
+        title = title_template.format(channel_name=channel_name)
+        
+        # 构建完整消息
+        push_message = f"{title}\n\n{summary_text}"
+        if footer_template:
+            push_message += f"\n\n{footer_template}"
         
         # 构建消息链
         message_chain = MessageChain().message(push_message)
@@ -659,6 +1254,21 @@ class TelegramSummaryPlugin(Star):
             end_time = datetime.now(timezone.utc)
             processing_time = (end_time - start_time).total_seconds()
             logger.error(f"定时任务执行失败: {type(e).__name__}: {e}，开始时间: {start_time}，结束时间: {end_time}，处理时间: {processing_time:.2f}秒")
+            
+            # 发送管理员告警
+            await self._send_admin_alert(
+                task_name="自动总结定时任务",
+                error=e,
+                context={
+                    "开始时间": start_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "结束时间": end_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "处理时间": f"{processing_time:.2f}秒",
+                    "处理频道数": total_channels,
+                    "无消息频道数": empty_channels,
+                    "推送成功": total_push_success,
+                    "推送失败": total_push_fail
+                }
+            )
     
     # ========== 命令处理 ==========
     
@@ -705,25 +1315,10 @@ class TelegramSummaryPlugin(Star):
                 # 验证指定的频道是否在配置中
                 valid_channels = []
                 for channel in specified_channels:
-                    # 智能匹配：支持频道名称或完整URL
+                    # 使用统一的 _match_channel 方法进行智能匹配
                     matched = False
                     for config_channel in self.CHANNELS:
-                        # 提取配置频道名称（去掉URL前缀）
-                        config_channel_name = config_channel.split('/')[-1]
-                        
-                        # 提取用户输入的频道名称（去掉URL前缀）
-                        user_channel_name = channel.split('/')[-1]
-                        
-                        # 匹配逻辑（双向匹配）：
-                        # 1. 完全匹配
-                        # 2. 频道名称匹配（提取后的名称相同）
-                        # 3. URL转换匹配（频道名称 <-> 完整URL）
-                        if (channel == config_channel or  # 完全相同
-                            channel == config_channel_name or  # 用户输入的是频道名，配置也是频道名
-                            user_channel_name == config_channel_name or  # 提取后的频道名相同
-                            (not channel.startswith('http') and f"https://t.me/{channel}" == config_channel) or  # 频道名 -> URL
-                            (not config_channel.startswith('http') and f"https://t.me/{config_channel}" == channel) or  # 频道名 <- URL
-                            (channel.startswith('http') and config_channel.startswith('http') and channel == config_channel)):  # 两个都是URL
+                        if self._match_channel(channel, config_channel):
                             valid_channels.append(config_channel)
                             matched = True
                             break
@@ -778,6 +1373,8 @@ class TelegramSummaryPlugin(Star):
     @filter.command("setprompt")
     async def handle_set_prompt(self, event: AstrMessageEvent):
         """设置自定义提示词"""
+        from astrbot.core.utils.session_waiter import session_waiter, SessionController
+        
         sender_id = event.get_sender_id()
         command = event.message_str
         logger.info(f"收到命令: {command}，发送者: {sender_id}")
@@ -794,9 +1391,46 @@ class TelegramSummaryPlugin(Star):
             logger.info(f"添加用户 {sender_id} 到提示词设置集合")
         
         yield event.plain_result(f"请发送新的提示词，我将使用它来生成总结。\n\n当前提示词：\n{self.CURRENT_PROMPT}")
-    
-
-    
+        
+        @session_waiter(timeout=60, record_history_chains=False)
+        async def setprompt_session(controller: SessionController, event: AstrMessageEvent):
+            """设置提示词的会话处理"""
+            sender_id = event.get_sender_id()
+            new_prompt = event.message_str.strip()
+            
+            logger.info(f"用户 {sender_id} 提交了新的提示词，长度: {len(new_prompt)} 字符")
+            
+            # 使用锁保护共享状态的修改
+            async with self._setting_prompt_lock:
+                # 更新提示词
+                self.CURRENT_PROMPT = new_prompt
+                
+                # 保存到文件
+                self.save_prompt(new_prompt)
+                
+                # 从正在设置提示词的集合中移除用户
+                if sender_id in self.setting_prompt_users:
+                    self.setting_prompt_users.remove(sender_id)
+                    logger.info(f"从提示词设置集合中移除用户 {sender_id}")
+            
+            logger.info(f"用户 {sender_id} 成功更新提示词")
+            await event.send(event.plain_result("✅ 提示词已成功更新！"))
+        
+        try:
+            await setprompt_session(event)
+        except TimeoutError:
+            # 超时处理
+            async with self._setting_prompt_lock:
+                if sender_id in self.setting_prompt_users:
+                    self.setting_prompt_users.remove(sender_id)
+                    logger.info(f"用户 {sender_id} 设置提示词超时，已从集合中移除")
+            yield event.plain_result("⏱️ 设置提示词超时，请重新使用 /setprompt 命令")
+        except Exception as e:
+            logger.error(f"设置提示词会话异常: {type(e).__name__}: {e}", exc_info=True)
+            async with self._setting_prompt_lock:
+                if sender_id in self.setting_prompt_users:
+                    self.setting_prompt_users.remove(sender_id)
+            yield event.plain_result("❌ 设置提示词时出错，请稍后重试")
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("showchannels")
     async def handle_show_channels(self, event: AstrMessageEvent):
@@ -970,177 +1604,29 @@ class TelegramSummaryPlugin(Star):
             # 检查是否要退出
             if user_input == "退出":
                 await event.send(event.plain_result("已取消登录"))
-                if login_state.get('client'):
-                    await login_state['client'].disconnect()
-                del self.login_states[sender_id]
+                await self._cleanup_login_session(sender_id)
                 controller.stop()
                 return
             
-            # 阶段1：获取手机号
-            if stage == 'phone':
-                # 验证手机号格式
-                if not user_input.startswith('+'):
-                    await event.send(event.plain_result(
-                        "❌ **手机号格式错误**\n\n"
-                        "手机号必须以 `+` 开头（包含国家代码）\n"
-                        "正确示例：`+8613812345678`\n\n"
-                        "请重新输入手机号，或发送 `退出` 取消登录"
-                    ))
-                    return
-                
-                phone = user_input
-                logger.info(f"用户 {sender_id} 输入手机号: {phone}")
-                
-                # 提示正在连接
-                await event.send(event.plain_result("📡 正在连接到 Telegram 服务器并请求验证码..."))
-                
-                try:
-                    # 创建Telegram客户端（使用固定的session文件）
-                    session_file = self.USER_SESSION_FILE
-                    api_id = int(self.API_ID)
-                    
-                    client = TelegramClient(session_file, api_id, self.API_HASH)
-                    await client.connect()
-                    
-                    logger.info(f"为用户 {sender_id} 创建Telegram客户端，会话文件: {session_file}")
-                    
-                    try:
-                        # 发送验证码
-                        await client.send_code_request(phone)
-                        
-                        logger.info(f"验证码已发送到用户 {sender_id} 的手机/Telegram应用")
-                        
-                        # 更新登录状态
-                        login_state['stage'] = 'code'
-                        login_state['phone'] = phone
-                        login_state['client'] = client
-                        login_state['session_file'] = session_file
-                        
-                        # 提示用户输入验证码
-                        await event.send(event.plain_result(
-                            "📩 **验证码已发送**\n\n"
-                            "验证码已发送到您的 Telegram 应用或短信\n"
-                            "请输入您收到的验证码\n\n"
-                            "⏱️ 会话将在 120 秒后超时，或发送 `退出` 取消登录"
-                        ))
-                        
+            # 使用 match-case 处理不同登录阶段（Python 3.10+）
+            match stage:
+                case 'phone':
+                    success, should_stop = await self._handle_phone_stage(event, user_input, login_state, sender_id)
+                    if not should_stop:
                         controller.keep(timeout=120, reset_timeout=True)
-                        
-                    except Exception as e:
-                        logger.error(f"发送验证码失败: {type(e).__name__}: {e}")
-                        await event.send(event.plain_result(
-                            f"❌ **发送验证码失败**\n\n"
-                            f"错误：{e}\n\n"
-                            "请检查手机号和网络连接后重试"
-                        ))
-                        await client.disconnect()
-                        del self.login_states[sender_id]
-                        controller.stop()
-                        
-                except Exception as e:
-                    logger.error(f"登录流程异常: {type(e).__name__}: {e}")
-                    await event.send(event.plain_result(
-                        f"❌ **登录流程异常**\n\n"
-                        f"错误：{e}"
-                    ))
-                    del self.login_states[sender_id]
-                    controller.stop()
-            
-            # 阶段2：获取验证码
-            elif stage == 'code':
-                code = user_input
-                phone = login_state['phone']
-                client = login_state['client']
                 
-                logger.info(f"用户 {sender_id} 输入验证码")
-                
-                try:
-                    # 尝试使用验证码登录
-                    await client.sign_in(phone, code)
-                    
-                    logger.info(f"用户 {sender_id} Telegram登录成功（无两步验证）")
-                    
-                    await event.send(event.plain_result(
-                        "✅ **登录成功！**\n\n"
-                        "您的 Telegram 账号已成功登录\n"
-                        "Session 已保存，后续将自动使用此账号"
-                    ))
-                    
-                    # 保持连接一小段时间确保session正确保存
-                    await asyncio.sleep(2)
-                    await client.disconnect()
-                    del self.login_states[sender_id]
-                    controller.stop()
-                    
-                except Exception as password_error:
-                    error_msg = str(password_error)
-                    logger.info(f"用户 {sender_id} 登录时需要两步验证: {error_msg}")
-                    
-                    # 检查是否是两步验证错误
-                    if "SessionPasswordNeededError" in error_msg or ("verification" in error_msg.lower() and "password" in error_msg.lower()):
-                        # 更新登录状态
-                        login_state['stage'] = 'password'
-                        
-                        # 提示用户输入密码
-                        await event.send(event.plain_result(
-                            "🔐 **检测到两步验证**\n\n"
-                            "您的账号启用了两步验证（云密码）\n"
-                            "请输入您的两步验证密码\n\n"
-                            "⚠️ **安全提示**：输入密码后建议手动撤回该消息\n"
-                            "⏱️ 会话将在 120 秒后超时，或发送 `退出` 取消登录"
-                        ))
-                        
+                case 'code':
+                    success, should_stop = await self._handle_code_stage(event, user_input, login_state, sender_id)
+                    if not should_stop:
                         controller.keep(timeout=120, reset_timeout=True)
-                    else:
-                        # 其他类型的错误
-                        logger.error(f"用户 {sender_id} 验证码登录失败: {password_error}")
-                        await event.send(event.plain_result(
-                            "❌ **登录失败**\n\n"
-                            f"错误信息：{password_error}\n"
-                            "可能的原因：\n"
-                            "• 验证码错误或已过期\n"
-                            "• 手机号格式不正确\n"
-                            "• 网络连接问题\n\n"
-                            "请使用 `/tg_login` 重新开始"
-                        ))
-                        await client.disconnect()
-                        del self.login_states[sender_id]
-                        controller.stop()
-            
-            # 阶段3：获取两步验证密码
-            elif stage == 'password':
-                password = user_input
-                client = login_state['client']
                 
-                logger.info(f"用户 {sender_id} 输入两步验证密码")
+                case 'password':
+                    await self._handle_password_stage(event, user_input, login_state, sender_id)
                 
-                try:
-                    # 使用密码登录
-                    await client.sign_in(password=password)
-                    
-                    logger.info(f"用户 {sender_id} Telegram登录成功（使用两步验证）")
-                    
-                    await event.send(event.plain_result(
-                        "✅ **登录成功！**\n\n"
-                        "您的 Telegram 账号已成功登录\n"
-                        "Session 已保存，后续将自动使用此账号"
-                    ))
-                    
-                    # 保持连接一小段时间确保session正确保存
-                    await asyncio.sleep(2)
-                    await client.disconnect()
-                    del self.login_states[sender_id]
-                    controller.stop()
-                    
-                except Exception as pwd_error:
-                    logger.error(f"用户 {sender_id} 两步验证密码错误: {pwd_error}")
-                    await event.send(event.plain_result(
-                        "❌ **两步验证密码错误**\n\n"
-                        f"登录失败：{pwd_error}\n\n"
-                        "请检查密码后重试，使用 `/tg_login` 重新开始"
-                    ))
-                    await client.disconnect()
-                    del self.login_states[sender_id]
+                case _:
+                    logger.error(f"未知的登录阶段: {stage}")
+                    await event.send(event.plain_result("登录状态异常，请使用 `/tg_login` 重新开始"))
+                    await self._cleanup_login_session(sender_id)
                     controller.stop()
         
         try:
