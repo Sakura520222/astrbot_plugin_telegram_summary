@@ -1,9 +1,12 @@
 """AstrBot Telegram频道消息总结插件"""
 import asyncio
+import json
 import os
+import stat
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # AstrBot 插件 API
@@ -12,7 +15,7 @@ from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 
-@register("telegram_summary", "Sakura520222", "一个 Telegram 频道消息总结插件，每周自动生成指定频道的消息汇总报告，支持自动推送到QQ群组和用户。", "1.2.1", "https://github.com/Sakura520222/astrbot_plugin_telegram_summary")
+@register("telegram_summary", "Sakura520222", "一个 Telegram 频道消息总结插件，每周自动生成指定频道的消息汇总报告，支持自动推送到QQ群组和用户。", "1.2.2", "https://github.com/Sakura520222/astrbot_plugin_telegram_summary")
 class TelegramSummaryPlugin(Star):
     """Telegram 频道消息总结插件
     
@@ -135,7 +138,6 @@ class TelegramSummaryPlugin(Star):
                 # 尝试设置文件权限为 600 (仅所有者可读写)
                 # Windows: 设置为只读属性
                 # Unix/Linux: 设置为 rw-------
-                import stat
                 os.chmod(self.USER_SESSION_FILE, 0o600)
                 logger.debug(f"已设置 session 文件权限: {self.USER_SESSION_FILE}")
             except Exception as e:
@@ -181,15 +183,15 @@ class TelegramSummaryPlugin(Star):
         
         # Telegram 配置（带验证）
         telegram_config = config.get('telegram', {})
-        self.API_ID = self._validate_api_id(telegram_config.get('api_id'))
-        self.API_HASH = self._validate_api_hash(telegram_config.get('api_hash'))
+        self.api_id = self._validate_api_id(telegram_config.get('api_id'))
+        self.api_hash = self._validate_api_hash(telegram_config.get('api_hash'))
         
         # 频道配置（带验证）
-        self.CHANNELS = self._validate_channels(config.get('channels', []))
-        logger.info(f"已加载频道列表: {self.CHANNELS}")
+        self.channels = self._validate_channels(config.get('channels', []))
+        logger.info(f"已加载频道列表: {self.channels}")
         
         # 提示词配置
-        self.CURRENT_PROMPT = config.get('prompt', self.DEFAULT_PROMPT)
+        self.current_prompt = config.get('prompt', self.DEFAULT_PROMPT)
         logger.info("已加载提示词配置")
         
         # AI 提供商配置（带验证）
@@ -572,46 +574,48 @@ class TelegramSummaryPlugin(Star):
         # 提示正在连接
         await event.send(event.plain_result("📡 正在连接到 Telegram 服务器并请求验证码..."))
         
-        try:
-            # 创建Telegram客户端（使用固定的session文件）
-            session_file = self.USER_SESSION_FILE
-            api_id = int(self.API_ID)
-            
-            client = TelegramClient(session_file, api_id, self.API_HASH)
-            await client.connect()
-            
-            logger.info(f"为用户 {sender_id} 创建Telegram客户端，会话文件: {session_file}")
-            
-            # 发送验证码
-            await client.send_code_request(phone)
-            
-            logger.info(f"验证码已发送到用户 {sender_id} 的手机/Telegram应用")
-            
-            # 更新登录状态
-            login_state['stage'] = 'code'
-            login_state['phone'] = phone
-            login_state['client'] = client
-            login_state['session_file'] = session_file
-            
-            # 提示用户输入验证码
-            await event.send(event.plain_result(
-                "📩 **验证码已发送**\n\n"
-                "验证码已发送到您的 Telegram 应用或短信\n"
-                "请输入您收到的验证码\n\n"
-                "⏱️ 会话将在 120 秒后超时，或发送 `退出` 取消登录"
-            ))
-            
-            return True, False
-            
-        except Exception as e:
-            logger.error(f"发送验证码失败: {type(e).__name__}: {e}")
-            await event.send(event.plain_result(
-                f"❌ **发送验证码失败**\n\n"
-                f"错误：{e}\n\n"
-                "请检查手机号和网络连接后重试"
-            ))
-            await self._cleanup_login_session(sender_id)
-            return False, True
+        # 使用锁防止与定时任务中的 Telegram Client 发生 session 文件冲突
+        async with self._telegram_client_lock:
+            try:
+                # 创建Telegram客户端（使用固定的session文件）
+                session_file = self.USER_SESSION_FILE
+                api_id = int(self.api_id)
+                
+                client = TelegramClient(session_file, api_id, self.api_hash)
+                await client.connect()
+                
+                logger.info(f"为用户 {sender_id} 创建Telegram客户端，会话文件: {session_file}")
+                
+                # 发送验证码
+                await client.send_code_request(phone)
+                
+                logger.info(f"验证码已发送到用户 {sender_id} 的手机/Telegram应用")
+                
+                # 更新登录状态
+                login_state['stage'] = 'code'
+                login_state['phone'] = phone
+                login_state['client'] = client
+                login_state['session_file'] = session_file
+                
+                # 提示用户输入验证码
+                await event.send(event.plain_result(
+                    "📩 **验证码已发送**\n\n"
+                    "验证码已发送到您的 Telegram 应用或短信\n"
+                    "请输入您收到的验证码\n\n"
+                    "⏱️ 会话将在 120 秒后超时，或发送 `退出` 取消登录"
+                ))
+                
+                return True, False
+                
+            except Exception as e:
+                logger.error(f"发送验证码失败: {type(e).__name__}: {e}")
+                await event.send(event.plain_result(
+                    f"❌ **发送验证码失败**\n\n"
+                    f"错误：{e}\n\n"
+                    "请检查手机号和网络连接后重试"
+                ))
+                await self._cleanup_login_session(sender_id)
+                return False, True
     
     async def _handle_code_stage(self, event, user_input: str, login_state: dict, sender_id: str):
         """处理登录流程的验证码输入阶段
@@ -648,39 +652,37 @@ class TelegramSummaryPlugin(Star):
             await self._cleanup_login_session(sender_id)
             return True, True
             
-        except Exception as password_error:
-            error_msg = str(password_error)
-            logger.info(f"用户 {sender_id} 登录时需要两步验证: {error_msg}")
+        except SessionPasswordNeededError:
+            # 明确捕获两步验证异常
+            logger.info(f"用户 {sender_id} 登录时需要两步验证")
             
-            # 检查是否是两步验证错误
-            if "SessionPasswordNeededError" in error_msg or ("verification" in error_msg.lower() and "password" in error_msg.lower()):
-                # 更新登录状态
-                login_state['stage'] = 'password'
-                
-                # 提示用户输入密码
-                await event.send(event.plain_result(
-                    "🔐 **检测到两步验证**\n\n"
-                    "您的账号启用了两步验证（云密码）\n"
-                    "请输入您的两步验证密码\n\n"
-                    "⚠️ **安全提示**：输入密码后建议手动撤回该消息\n"
-                    "⏱️ 会话将在 120 秒后超时，或发送 `退出` 取消登录"
-                ))
-                
-                return False, False
-            else:
-                # 其他类型的错误
-                logger.error(f"用户 {sender_id} 验证码登录失败: {password_error}")
-                await event.send(event.plain_result(
-                    "❌ **登录失败**\n\n"
-                    f"错误信息：{password_error}\n"
-                    "可能的原因：\n"
-                    "• 验证码错误或已过期\n"
-                    "• 手机号格式不正确\n"
-                    "• 网络连接问题\n\n"
-                    "请使用 `/tg_login` 重新开始"
-                ))
-                await self._cleanup_login_session(sender_id)
-                return False, True
+            # 更新登录状态
+            login_state['stage'] = 'password'
+            
+            # 提示用户输入密码
+            await event.send(event.plain_result(
+                "🔐 **检测到两步验证**\n\n"
+                "您的账号启用了两步验证（云密码）\n"
+                "请输入您的两步验证密码\n\n"
+                "⚠️ **安全提示**：输入密码后建议手动撤回该消息\n"
+                "⏱️ 会话将在 120 秒后超时，或发送 `退出` 取消登录"
+            ))
+            
+            return False, False
+        except Exception as other_error:
+            # 其他类型的错误
+            logger.error(f"用户 {sender_id} 验证码登录失败: {other_error}")
+            await event.send(event.plain_result(
+                "❌ **登录失败**\n\n"
+                f"错误信息：{other_error}\n"
+                "可能的原因：\n"
+                "• 验证码错误或已过期\n"
+                "• 手机号格式不正确\n"
+                "• 网络连接问题\n\n"
+                "请使用 `/tg_login` 重新开始"
+            ))
+            await self._cleanup_login_session(sender_id)
+            return False, True
     
     async def _handle_password_stage(self, event, user_input: str, login_state: dict, sender_id: str):
         """处理登录流程的两步验证密码输入阶段
@@ -716,11 +718,11 @@ class TelegramSummaryPlugin(Star):
             await self._cleanup_login_session(sender_id)
             return True, True
             
-        except Exception as pwd_error:
-            logger.error(f"用户 {sender_id} 两步验证密码错误: {pwd_error}")
+        except Exception as e:
+            logger.error(f"两步验证密码错误: {type(e).__name__}: {e}")
             await event.send(event.plain_result(
                 "❌ **两步验证密码错误**\n\n"
-                f"登录失败：{pwd_error}\n\n"
+                f"登录失败：{e}\n\n"
                 "请检查密码后重试，使用 `/tg_login` 重新开始"
             ))
             await self._cleanup_login_session(sender_id)
@@ -756,7 +758,6 @@ class TelegramSummaryPlugin(Star):
     
     def load_config(self):
         """从配置文件读取AI配置"""
-        import json
         logger.info(f"开始读取配置文件: {self.CONFIG_FILE}")
         try:
             with open(self.CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -775,7 +776,6 @@ class TelegramSummaryPlugin(Star):
     
     def save_config(self, config):
         """保存AI配置到文件"""
-        import json
         logger.info(f"开始保存配置到文件: {self.CONFIG_FILE}")
         try:
             with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -786,7 +786,6 @@ class TelegramSummaryPlugin(Star):
     
     def load_last_summary_times(self):
         """从文件中读取各频道的上次总结时间，如果文件不存在则返回空字典"""
-        import json
         logger.info(f"开始读取各频道上次总结时间文件: {self.LAST_SUMMARY_FILE}")
         try:
             with open(self.LAST_SUMMARY_FILE, "r", encoding="utf-8") as f:
@@ -811,7 +810,6 @@ class TelegramSummaryPlugin(Star):
     
     def save_last_summary_times(self, times):
         """保存各频道的上次总结时间到文件"""
-        import json
         logger.info(f"开始保存各频道上次总结时间到文件: {self.LAST_SUMMARY_FILE}")
         try:
             time_dict = {}
@@ -842,7 +840,7 @@ class TelegramSummaryPlugin(Star):
             logger.info("开始抓取频道消息（已获取 Telegram Client 锁）")
             
             try:
-                async with TelegramClient(self.USER_SESSION_FILE, int(self.API_ID), self.API_HASH) as client:
+                async with TelegramClient(self.USER_SESSION_FILE, int(self.api_id), self.api_hash) as client:
                     current_time = datetime.now(timezone.utc)
                     
                     messages_by_channel = {}  # 按频道分组的消息字典
@@ -854,10 +852,10 @@ class TelegramSummaryPlugin(Star):
                         logger.info(f"正在抓取指定的 {len(channels)} 个频道的消息")
                     else:
                         # 抓取所有配置的频道
-                        if not self.CHANNELS:
+                        if not self.channels:
                             logger.warning("没有配置任何频道，无法抓取消息")
                             return messages_by_channel
-                        channels = self.CHANNELS
+                        channels = self.channels
                         logger.info(f"正在抓取所有 {len(channels)} 个频道的消息")
                     
                     total_message_count = 0
@@ -916,9 +914,9 @@ class TelegramSummaryPlugin(Star):
             return "本周无新动态。"
 
         context_text = "\n\n---\n\n".join(messages)
-        prompt = f"{self.CURRENT_PROMPT}{context_text}"
+        prompt = f"{self.current_prompt}{context_text}"
         
-        logger.debug(f"AI请求配置: 提供商={self.ai_provider}, 提示词长度={len(self.CURRENT_PROMPT)}字符, 上下文长度={len(context_text)}字符")
+        logger.debug(f"AI请求配置: 提供商={self.ai_provider}, 提示词长度={len(self.current_prompt)}字符, 上下文长度={len(context_text)}字符")
         logger.debug(f"AI请求总长度: {len(prompt)}字符")
         
         try:
@@ -1327,7 +1325,7 @@ class TelegramSummaryPlugin(Star):
                 for channel in specified_channels:
                     # 使用统一的 _match_channel 方法进行智能匹配
                     matched = False
-                    for config_channel in self.CHANNELS:
+                    for config_channel in self.channels:
                         if self._match_channel(channel, config_channel):
                             valid_channels.append(config_channel)
                             matched = True
@@ -1377,7 +1375,7 @@ class TelegramSummaryPlugin(Star):
         logger.info(f"收到命令: {command}，发送者: {sender_id}")
         
         logger.info(f"执行命令 {command} 成功")
-        yield event.plain_result(f"当前提示词：\n\n{self.CURRENT_PROMPT}")
+        yield event.plain_result(f"当前提示词：\n\n{self.current_prompt}")
     
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("setprompt")
@@ -1400,7 +1398,7 @@ class TelegramSummaryPlugin(Star):
             self.setting_prompt_users.add(sender_id)
             logger.info(f"添加用户 {sender_id} 到提示词设置集合")
         
-        yield event.plain_result(f"请发送新的提示词，我将使用它来生成总结。\n\n当前提示词：\n{self.CURRENT_PROMPT}")
+        yield event.plain_result(f"请发送新的提示词，我将使用它来生成总结。\n\n当前提示词：\n{self.current_prompt}")
         
         @session_waiter(timeout=60, record_history_chains=False)
         async def setprompt_session(controller: SessionController, event: AstrMessageEvent):
@@ -1413,7 +1411,7 @@ class TelegramSummaryPlugin(Star):
             # 使用锁保护共享状态的修改
             async with self._setting_prompt_lock:
                 # 更新提示词
-                self.CURRENT_PROMPT = new_prompt
+                self.current_prompt = new_prompt
                 
                 # 保存到文件
                 self.save_prompt(new_prompt)
@@ -1451,13 +1449,13 @@ class TelegramSummaryPlugin(Star):
         
         logger.info(f"执行命令 {command} 成功")
         
-        if not self.CHANNELS:
+        if not self.channels:
             yield event.plain_result("当前没有配置任何频道")
             return
         
         # 构建频道列表消息
         channels_msg = "当前配置的频道列表：\n\n"
-        for i, channel in enumerate(self.CHANNELS, 1):
+        for i, channel in enumerate(self.channels, 1):
             channels_msg += f"{i}. {channel}\n"
         
         yield event.plain_result(channels_msg)
@@ -1479,19 +1477,19 @@ class TelegramSummaryPlugin(Star):
                 return
             
             # 检查频道是否已存在
-            if channel_url in self.CHANNELS:
+            if channel_url in self.channels:
                 yield event.plain_result(f"频道 {channel_url} 已存在于列表中")
                 return
             
             # 添加频道到列表
-            self.CHANNELS.append(channel_url)
+            self.channels.append(channel_url)
             
             # 保存到AstrBot配置系统
-            self.config['channels'] = self.CHANNELS
+            self.config['channels'] = self.channels
             self.config.save_config()
             
             logger.info(f"已添加频道 {channel_url} 到列表并保存到配置文件")
-            yield event.plain_result(f"频道 {channel_url} 已成功添加到列表中\n\n当前频道数量：{len(self.CHANNELS)}")
+            yield event.plain_result(f"频道 {channel_url} 已成功添加到列表中\n\n当前频道数量：{len(self.channels)}")
             
         except ValueError:
             # 没有提供频道URL
@@ -1517,19 +1515,19 @@ class TelegramSummaryPlugin(Star):
                 return
             
             # 检查频道是否存在
-            if channel_url not in self.CHANNELS:
+            if channel_url not in self.channels:
                 yield event.plain_result(f"频道 {channel_url} 不在列表中")
                 return
             
             # 从列表中删除频道
-            self.CHANNELS.remove(channel_url)
+            self.channels.remove(channel_url)
             
             # 保存到AstrBot配置系统
-            self.config['channels'] = self.CHANNELS
+            self.config['channels'] = self.channels
             self.config.save_config()
             
             logger.info(f"已从列表中删除频道 {channel_url} 并保存到配置文件")
-            yield event.plain_result(f"频道 {channel_url} 已成功从列表中删除\n\n当前频道数量：{len(self.CHANNELS)}")
+            yield event.plain_result(f"频道 {channel_url} 已成功从列表中删除\n\n当前频道数量：{len(self.channels)}")
             
         except ValueError:
             # 没有提供频道URL或频道不存在
@@ -1548,7 +1546,6 @@ class TelegramSummaryPlugin(Star):
         
         try:
             # 删除上次总结时间文件
-            import os
             if os.path.exists(self.LAST_SUMMARY_FILE):
                 os.remove(self.LAST_SUMMARY_FILE)
                 logger.info(f"已删除上次总结时间文件: {self.LAST_SUMMARY_FILE}")

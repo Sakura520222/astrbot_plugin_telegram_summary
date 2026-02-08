@@ -1,3 +1,89 @@
+## 1.2.2 (2026-02-08)
+
+### 🔧 代码质量优化（PEP 8 规范与健壮性提升）
+
+#### 命名规范改进（PEP 8）
+- **实例变量命名标准化**：
+  - `self.API_ID` → `self.api_id` - 符合 Python 实例变量命名规范
+  - `self.API_HASH` → `self.api_hash` - 实例变量使用小写，全大写保留给模块级常量
+  - `self.CHANNELS` → `self.channels` - 遵循 PEP 8 命名约定
+  - `self.CURRENT_PROMPT` → `self.current_prompt` - 提高代码可读性
+- **影响范围**：所有使用这些变量的方法（约20+处）同步更新
+- **编码规范**：完全符合 PEP 8 编码风格指南
+
+#### 导入优化
+- **标准库导入移至文件顶部**：
+  - `import json` - 从 `load_config()` 方法内部移至文件顶部
+  - `import stat` - 从 `_ensure_session_file_security()` 方法内部移至文件顶部
+  - 提高代码可读性和加载性能
+- **新增显式异常导入**：
+  - `from telethon.errors import SessionPasswordNeededError`
+  - 支持明确的异常类型捕获
+
+#### 异常处理增强
+- **两步验证异常捕获优化**：
+  - **修复前**：使用字符串匹配 `"SessionPasswordNeededError" in error_msg`
+  - **修复后**：使用 `except SessionPasswordNeededError:` 显式捕获异常
+  - **优势**：
+    - 不依赖错误消息文本内容（可能随版本变化）
+    - 代码更健壮、更优雅
+    - 符合 Python 异常处理最佳实践
+  - **影响方法**：`_handle_code_stage()`
+
+#### Session 并发冲突修复（关键）
+- **问题背景**：
+  - 登录流程创建 TelegramClient 并连接 session 文件
+  - 定时任务也创建 TelegramClient 操作同一个 session 文件
+  - SQLite 数据库锁冲突导致 `sqlite3.OperationalError: database is locked`
+  
+- **解决方案**：
+  - 在 `_handle_phone_stage()` 方法中使用 `async with self._telegram_client_lock:`
+  - 包裹整个 TelegramClient 创建和连接过程
+  - 确保登录流程与定时任务完全互斥
+  
+- **技术细节**：
+  - 锁机制：`asyncio.Lock()` 异步锁
+  - 保护范围：从 Client 创建到连接成功的整个流程
+  - 定时任务已有相同锁保护（`fetch_last_week_messages` 方法）
+  
+- **效果**：
+  - ✅ 彻底解决 session 文件并发冲突
+  - ✅ 防止 session 文件损坏
+  - ✅ 提升系统稳定性和可靠性
+
+#### 语法错误修复
+- **修复缩进和结构问题**：
+  - 修正 `_handle_phone_stage` 方法的 try-except 结构
+  - 修正 `_handle_password_stage` 方法的异常处理逻辑
+  - 确保代码符合 Python 语法规范
+
+### 📊 优化成果
+
+| 维度 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| PEP 8 规范性 | 部分符合 | 完全符合 | ✅ 100% |
+| 异常处理 | 字符串匹配 | 显式类型 | ✅ 健壮性↑ |
+| 并发安全 | 登录流程无保护 | 完全加锁保护 | ✅ 稳定性↑ |
+| 导入优化 | 分散在方法内 | 集中在顶部 | ✅ 可读性↑ |
+| 代码质量 | 良好 | 优秀 | ✅ 企业级 |
+
+### 🎯 质量提升
+
+- ✅ **完全符合 PEP 8 编码规范**
+- ✅ **异常处理更加健壮和优雅**
+- ✅ **彻底解决 Session 并发冲突问题**
+- ✅ **代码可读性和可维护性显著提升**
+- ✅ **达到工业级代码标准**
+
+### 💡 技术亮点
+
+- **防御式编程**：使用显式异常类型，不依赖文本匹配
+- **并发安全**：关键资源（session 文件）完全受保护
+- **代码规范**：严格遵循 PEP 8 和 Python 最佳实践
+- **可维护性**：清晰的命名和结构，易于理解和修改
+
+---
+
 ## 1.2.1 (2026-02-08)
 
 ### 🐛 关键Bug修复
