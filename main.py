@@ -2,7 +2,8 @@
 import asyncio
 import json
 import os
-import stat
+import random
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from telethon import TelegramClient
@@ -77,6 +78,24 @@ class TelegramSummaryPlugin(Star):
     默认的定时任务执行时间，格式为"星期 时间"。
     可以在插件配置中修改此值。
     """
+    
+    # 登录状态机阶段常量
+    LOGIN_STAGE_PHONE: str = "phone"
+    LOGIN_STAGE_CODE: str = "code"
+    LOGIN_STAGE_PASSWORD: str = "password"
+    
+    # Telegram 抓取相关常量
+    MAX_MESSAGES_PER_CHANNEL: int = 1000
+    """每个频道单次最多抓取消息数，避免高活跃频道产生过大的 AI 输入。"""
+    
+    TELEGRAM_CONNECT_TIMEOUT: int = 30
+    """Telegram 客户端连接超时时间（秒）。"""
+    
+    MAX_LOGIN_FAILURES: int = 3
+    """登录流程中验证码/密码连续失败的最大允许次数。"""
+    
+    SCHEDULER_TIMEZONE: str = "Asia/Shanghai"
+    """定时任务使用的时区。"""
     
     def __init__(self, context: Context, config: AstrBotConfig):
         """初始化插件
@@ -453,10 +472,17 @@ class TelegramSummaryPlugin(Star):
     
     def _setup_scheduler(self):
         """设置定时任务调度器"""
-        self.scheduler = AsyncIOScheduler()
+        self.scheduler = AsyncIOScheduler(timezone=self.SCHEDULER_TIMEZONE)
         day_of_week, hour, minute = self.parse_summary_time(self.auto_summary_time)
-        self.scheduler.add_job(self.main_job, 'cron', day_of_week=day_of_week, hour=hour, minute=minute)
-        logger.info(f"定时任务已配置：{self.auto_summary_time}")
+        self.scheduler.add_job(
+            self.main_job,
+            'cron',
+            day_of_week=day_of_week,
+            hour=hour,
+            minute=minute,
+            timezone=self.SCHEDULER_TIMEZONE,
+        )
+        logger.info(f"定时任务已配置：{self.auto_summary_time}（时区: {self.SCHEDULER_TIMEZONE}）")
         self.scheduler.start()
         logger.info("调度器已启动")
     
@@ -524,12 +550,38 @@ class TelegramSummaryPlugin(Star):
             return False
         
         self.login_states[sender_id] = {
-            'stage': 'phone',
+            'stage': self.LOGIN_STAGE_PHONE,
             'phone': None,
             'client': None,
-            'session_file': None
+            'session_file': None,
+            'failures': 0,
         }
         return True
+    
+    async def _record_login_failure(self, event, login_state: dict, sender_id: str, reason: str) -> bool:
+        """记录登录失败次数，超过阈值时清理会话并要求重新开始。
+        
+        Returns:
+            bool: True 表示已超过限制并终止会话。
+        """
+        failures = login_state.get('failures', 0) + 1
+        login_state['failures'] = failures
+        remaining = self.MAX_LOGIN_FAILURES - failures
+        logger.warning(f"用户 {sender_id} 登录失败（{reason}），连续失败次数: {failures}")
+        
+        if failures >= self.MAX_LOGIN_FAILURES:
+            await event.send(event.plain_result(
+                "❌ **登录失败次数过多**\n\n"
+                "为保护账号安全，本次登录流程已终止，请稍后使用 `/tg_login` 重新开始"
+            ))
+            await self._cleanup_login_session(sender_id)
+            return True
+        
+        await event.send(event.plain_result(
+            f"⚠️ 登录验证失败，请重新输入。剩余尝试次数：{remaining}\n"
+            "如需取消，请发送 `退出`"
+        ))
+        return False
     
     async def _cleanup_login_session(self, sender_id: str):
         """清理登录会话资源
@@ -544,7 +596,17 @@ class TelegramSummaryPlugin(Star):
                 logger.warning(f"断开Telegram客户端时出错: {type(e).__name__}: {e}")
         
         if sender_id in self.login_states:
+            # 显式清除手机号等敏感字段，降低内存中 PII 残留风险。
+            self.login_states[sender_id].clear()
             del self.login_states[sender_id]
+    
+    def _mask_phone_number(self, phone: str) -> str:
+        """对手机号进行日志脱敏，仅保留前缀和末尾少量字符。"""
+        if not phone:
+            return "<empty>"
+        if len(phone) <= 6:
+            return "***"
+        return f"{phone[:3]}***{phone[-4:]}"
     
     async def _handle_phone_stage(self, event, user_input: str, login_state: dict, sender_id: str):
         """处理登录流程的手机号输入阶段
@@ -569,12 +631,14 @@ class TelegramSummaryPlugin(Star):
             return False, False
         
         phone = user_input
-        logger.info(f"用户 {sender_id} 输入手机号: {phone}")
+        masked_phone = self._mask_phone_number(phone)
+        logger.info(f"用户 {sender_id} 输入手机号: {masked_phone}")
         
         # 提示正在连接
         await event.send(event.plain_result("📡 正在连接到 Telegram 服务器并请求验证码..."))
         
         # 使用锁防止与定时任务中的 Telegram Client 发生 session 文件冲突
+        client = None
         async with self._telegram_client_lock:
             try:
                 # 创建Telegram客户端（使用固定的session文件）
@@ -582,7 +646,10 @@ class TelegramSummaryPlugin(Star):
                 api_id = int(self.api_id)
                 
                 client = TelegramClient(session_file, api_id, self.api_hash)
-                await client.connect()
+                await asyncio.wait_for(client.connect(), timeout=self.TELEGRAM_CONNECT_TIMEOUT)
+                # 连接成功后立即移交给登录状态，确保任意后续异常都能由统一清理逻辑断开连接。
+                login_state['client'] = client
+                login_state['session_file'] = session_file
                 
                 logger.info(f"为用户 {sender_id} 创建Telegram客户端，会话文件: {session_file}")
                 
@@ -592,10 +659,8 @@ class TelegramSummaryPlugin(Star):
                 logger.info(f"验证码已发送到用户 {sender_id} 的手机/Telegram应用")
                 
                 # 更新登录状态
-                login_state['stage'] = 'code'
+                login_state['stage'] = self.LOGIN_STAGE_CODE
                 login_state['phone'] = phone
-                login_state['client'] = client
-                login_state['session_file'] = session_file
                 
                 # 提示用户输入验证码
                 await event.send(event.plain_result(
@@ -608,12 +673,19 @@ class TelegramSummaryPlugin(Star):
                 return True, False
                 
             except Exception as e:
-                logger.error(f"发送验证码失败: {type(e).__name__}: {e}")
+                logger.error(f"发送验证码失败: {type(e).__name__}: {e}", exc_info=True)
                 await event.send(event.plain_result(
-                    f"❌ **发送验证码失败**\n\n"
-                    f"错误：{e}\n\n"
-                    "请检查手机号和网络连接后重试"
+                    "❌ **发送验证码失败**\n\n"
+                    "发送验证码失败，请检查手机号、网络连接或稍后重试"
                 ))
+                if client is not None and login_state.get('client') is not client:
+                    try:
+                        await client.disconnect()
+                    except Exception as disconnect_error:
+                        logger.warning(
+                            "断开未移交的Telegram客户端时出错: "
+                            f"{type(disconnect_error).__name__}: {disconnect_error}"
+                        )
                 await self._cleanup_login_session(sender_id)
                 return False, True
     
@@ -632,6 +704,13 @@ class TelegramSummaryPlugin(Star):
         code = user_input
         phone = login_state['phone']
         client = login_state['client']
+        
+        if not re.fullmatch(r"\d{4,6}", code):
+            await event.send(event.plain_result(
+                "❌ **验证码格式错误**\n\n"
+                "验证码通常为 4-6 位数字，请重新输入，或发送 `退出` 取消登录"
+            ))
+            return False, False
         
         logger.info(f"用户 {sender_id} 输入验证码")
         
@@ -657,7 +736,7 @@ class TelegramSummaryPlugin(Star):
             logger.info(f"用户 {sender_id} 登录时需要两步验证")
             
             # 更新登录状态
-            login_state['stage'] = 'password'
+            login_state['stage'] = self.LOGIN_STAGE_PASSWORD
             
             # 提示用户输入密码
             await event.send(event.plain_result(
@@ -671,18 +750,9 @@ class TelegramSummaryPlugin(Star):
             return False, False
         except Exception as other_error:
             # 其他类型的错误
-            logger.error(f"用户 {sender_id} 验证码登录失败: {other_error}")
-            await event.send(event.plain_result(
-                "❌ **登录失败**\n\n"
-                f"错误信息：{other_error}\n"
-                "可能的原因：\n"
-                "• 验证码错误或已过期\n"
-                "• 手机号格式不正确\n"
-                "• 网络连接问题\n\n"
-                "请使用 `/tg_login` 重新开始"
-            ))
-            await self._cleanup_login_session(sender_id)
-            return False, True
+            logger.error(f"用户 {sender_id} 验证码登录失败: {type(other_error).__name__}: {other_error}")
+            should_stop = await self._record_login_failure(event, login_state, sender_id, "验证码验证失败")
+            return False, should_stop
     
     async def _handle_password_stage(self, event, user_input: str, login_state: dict, sender_id: str):
         """处理登录流程的两步验证密码输入阶段
@@ -719,14 +789,9 @@ class TelegramSummaryPlugin(Star):
             return True, True
             
         except Exception as e:
-            logger.error(f"两步验证密码错误: {type(e).__name__}: {e}")
-            await event.send(event.plain_result(
-                "❌ **两步验证密码错误**\n\n"
-                f"登录失败：{e}\n\n"
-                "请检查密码后重试，使用 `/tg_login` 重新开始"
-            ))
-            await self._cleanup_login_session(sender_id)
-            return False, True
+            logger.error(f"两步验证密码验证失败: {type(e).__name__}: {e}")
+            should_stop = await self._record_login_failure(event, login_state, sender_id, "两步验证密码验证失败")
+            return False, should_stop
     
     def load_prompt(self):
         """从文件中读取提示词，如果文件不存在则使用默认提示词"""
@@ -875,8 +940,13 @@ class TelegramSummaryPlugin(Star):
                                 start_time = current_time - timedelta(days=self.DEFAULT_SUMMARY_DAYS)
                                 logger.info(f"频道 {channel} 没有上次总结时间，使用默认时间范围: 过去{self.DEFAULT_SUMMARY_DAYS}天 ({start_time})")
                             
-                            # 异步迭代消息，添加网络中断保护
-                            async for message in client.iter_messages(channel, offset_date=start_time, reverse=True):
+                            # 异步迭代消息，添加网络中断保护，并限制单频道最大抓取数量
+                            async for message in client.iter_messages(
+                                channel,
+                                offset_date=start_time,
+                                reverse=True,
+                                limit=self.MAX_MESSAGES_PER_CHANNEL,
+                            ):
                                 total_message_count += 1
                                 channel_message_count += 1
                                 if message.text:
@@ -888,6 +958,12 @@ class TelegramSummaryPlugin(Star):
                                     # 每抓取10条消息记录一次日志
                                     if len(channel_messages) % 10 == 0:
                                         logger.debug(f"频道 {channel} 已抓取 {len(channel_messages)} 条有效消息")
+                        
+                            if channel_message_count >= self.MAX_MESSAGES_PER_CHANNEL:
+                                logger.warning(
+                                    f"频道 {channel} 已达到单次抓取上限 {self.MAX_MESSAGES_PER_CHANNEL} 条，"
+                                    "可能存在更多消息未处理；建议缩短总结周期或减少高活跃频道"
+                                )
                         
                         except Exception as channel_error:
                             logger.error(f"抓取频道 {channel} 时出错: {type(channel_error).__name__}: {channel_error}")
@@ -1010,12 +1086,10 @@ class TelegramSummaryPlugin(Star):
                 f"发生时间: {error_time}\n"
             )
             
-            # 添加错误摘要（限制长度）
+            # 告警消息避免透传原始异常详情，详细信息仅写入服务端日志。
             if error_msg:
-                error_summary = error_msg[:500]
-                if len(error_msg) > 500:
-                    error_summary += "..."
-                alert_message += f"错误摘要: {error_summary}\n"
+                logger.error(f"任务 {task_name} 详细错误: {error_type}: {error_msg}")
+                alert_message += "错误摘要: 运行时发生异常，详细信息请查看服务端日志\n"
             
             # 添加额外上下文
             if context:
@@ -1121,7 +1195,6 @@ class TelegramSummaryPlugin(Star):
             dict: 推送统计信息 {success: 成功数, fail: 失败数}
         """
         from astrbot.api.event import MessageChain
-        import random
         
         if not summary_text:
             logger.warning("总结内容为空，跳过推送")
@@ -1168,7 +1241,7 @@ class TelegramSummaryPlugin(Star):
                 
                 # 随机延迟，避免触发频率限制
                 if i < len(targets) - 1:
-                    await asyncio.sleep(random.uniform(1, 3))
+                    await asyncio.sleep(random.uniform(self.PUSH_DELAY_MIN, self.PUSH_DELAY_MAX))
             except Exception as e:
                 logger.error(f"推送到目标 {umo} 失败: {type(e).__name__}: {e}")
                 fail_count += 1
@@ -1571,32 +1644,30 @@ class TelegramSummaryPlugin(Star):
         sender_id = event.get_sender_id()
         logger.info(f"用户 {sender_id} 请求进行Telegram登录")
         
-        # 使用锁保护登录状态
+        # 使用锁保护登录状态，并复用统一的状态初始化入口。
         async with self._login_states_lock:
-            # 检查用户是否已经在登录流程中
-            if sender_id in self.login_states:
+            if not self._init_login_state(sender_id):
                 yield event.plain_result("您已经在登录流程中，请先完成或使用 /tg_login 重新开始")
                 return
-            
-            # 初始化用户的登录状态
-            self.login_states[sender_id] = {
-                'stage': 'phone',
-                'phone': None,
-                'client': None,
-                'session_file': None
-            }
         
         # 提示用户输入手机号
         yield event.plain_result(
             "🚀 **开始 Telegram 登录流程**\n\n"
             "请输入您的手机号（必须带国家代码）\n"
             "示例：`+8613812345678`\n\n"
-            "⏱️ 会话将在 120 秒后超时"
+            f"⏱️ 会话将在 {self.SESSION_TIMEOUT} 秒后超时"
         )
         
-        @session_waiter(timeout=120, record_history_chains=False)
+        @session_waiter(timeout=self.SESSION_TIMEOUT, record_history_chains=False)
         async def tg_login_session(controller: SessionController, event: AstrMessageEvent):
             sender_id = event.get_sender_id()
+            
+            def update_session_controller(should_stop: bool) -> None:
+                """根据阶段处理结果统一更新登录会话控制器状态。"""
+                if should_stop:
+                    controller.stop()
+                else:
+                    controller.keep(timeout=self.SESSION_TIMEOUT, reset_timeout=True)
             
             # 检查用户是否在登录流程中
             if sender_id not in self.login_states:
@@ -1614,50 +1685,41 @@ class TelegramSummaryPlugin(Star):
                 await self._cleanup_login_session(sender_id)
                 controller.stop()
                 return
-            
-            # 使用 match-case 处理不同登录阶段（Python 3.10+）
-            match stage:
-                case 'phone':
-                    success, should_stop = await self._handle_phone_stage(event, user_input, login_state, sender_id)
-                    if not should_stop:
-                        controller.keep(timeout=120, reset_timeout=True)
-                
-                case 'code':
-                    success, should_stop = await self._handle_code_stage(event, user_input, login_state, sender_id)
-                    if not should_stop:
-                        controller.keep(timeout=120, reset_timeout=True)
-                
-                case 'password':
-                    await self._handle_password_stage(event, user_input, login_state, sender_id)
-                
-                case _:
-                    logger.error(f"未知的登录阶段: {stage}")
-                    await event.send(event.plain_result("登录状态异常，请使用 `/tg_login` 重新开始"))
-                    await self._cleanup_login_session(sender_id)
-                    controller.stop()
+            if stage == self.LOGIN_STAGE_PHONE:
+                _success, should_stop = await self._handle_phone_stage(event, user_input, login_state, sender_id)
+                update_session_controller(should_stop)
+            elif stage == self.LOGIN_STAGE_CODE:
+                _success, should_stop = await self._handle_code_stage(event, user_input, login_state, sender_id)
+                update_session_controller(should_stop)
+            elif stage == self.LOGIN_STAGE_PASSWORD:
+                _success, should_stop = await self._handle_password_stage(event, user_input, login_state, sender_id)
+                update_session_controller(should_stop)
+            else:
+                logger.error(f"未知的登录阶段: {stage}")
+                await event.send(event.plain_result("登录状态异常，请使用 `/tg_login` 重新开始"))
+                await self._cleanup_login_session(sender_id)
+                controller.stop()
         
         try:
             await tg_login_session(event)
         except TimeoutError:
-            # 清理登录状态
-            if sender_id in self.login_states and self.login_states[sender_id].get('client'):
-                await self.login_states[sender_id]['client'].disconnect()
-            if sender_id in self.login_states:
-                del self.login_states[sender_id]
+            await self._cleanup_login_session(sender_id)
             yield event.plain_result("⏱️ 登录会话已超时，请使用 `/tg_login` 重新开始")
         except Exception as e:
             logger.error(f"tg_login会话异常: {type(e).__name__}: {e}", exc_info=True)
-            # 清理登录状态
-            if sender_id in self.login_states and self.login_states[sender_id].get('client'):
-                await self.login_states[sender_id]['client'].disconnect()
-            if sender_id in self.login_states:
-                del self.login_states[sender_id]
+            await self._cleanup_login_session(sender_id)
             yield event.plain_result("❌ 登录过程出错，请检查网络连接和账号信息")
         finally:
             event.stop_event()
     async def terminate(self):
         """插件被卸载/停用时会调用。"""
-        logger.info("插件正在被卸载，停止调度器...")
+        logger.info("插件正在被卸载，清理登录会话并停止调度器...")
+        if self.login_states:
+            sender_ids = list(self.login_states.keys())
+            logger.info(f"正在清理 {len(sender_ids)} 个活跃登录会话")
+            for sender_id in sender_ids:
+                await self._cleanup_login_session(sender_id)
+        
         if hasattr(self, 'scheduler'):
             self.scheduler.shutdown()
             logger.info("调度器已停止")
