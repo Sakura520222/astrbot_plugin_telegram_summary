@@ -103,7 +103,10 @@ class TelegramSummaryPlugin(Star):
         self._load_configurations(config)
         self._init_concurrent_safety()
         self._init_runtime_state()
-        self._setup_scheduler()
+
+        # 仅在配置完整时启动定时任务
+        if self._configured:
+            self._setup_scheduler()
 
     def _init_data_directory(self):
         """初始化数据目录
@@ -187,14 +190,39 @@ class TelegramSummaryPlugin(Star):
             config: AstrBot 配置对象
 
         Raises:
-            ValueError: 当配置验证失败时
+            ValueError: 当配置验证失败时（配置已填写但格式不正确）
         """
         logger.info("开始从 AstrBot 配置系统加载配置...")
 
-        # Telegram 配置（带验证）
+        # 先设置所有属性的默认值，避免未配置时出现 AttributeError
+        self.api_id = None
+        self.api_hash = None
+        self.channels = []
+        self.current_prompt = self.DEFAULT_PROMPT
+        self.ai_provider = None
+        self.auto_summary_time = self.DEFAULT_AUTO_SUMMARY_TIME
+        self.admin_id = None
+        self.auto_push_groups = []
+        self.auto_push_users = []
+        self.message_templates = {}
+
+        # 检查 Telegram 必需配置是否已填写
         telegram_config = config.get("telegram", {})
-        self.api_id = self._validate_api_id(telegram_config.get("api_id"))
-        self.api_hash = self._validate_api_hash(telegram_config.get("api_hash"))
+        raw_api_id = telegram_config.get("api_id")
+        raw_api_hash = telegram_config.get("api_hash")
+
+        if self._is_empty_value(raw_api_id) or self._is_empty_value(raw_api_hash):
+            self._configured = False
+            logger.warning(
+                "Telegram API 配置未完成，插件将以未配置状态加载。\n"
+                "请在插件配置中设置 'telegram.api_id' 和 'telegram.api_hash'。\n"
+                "获取方式：访问 https://my.telegram.org/apps"
+            )
+            return
+
+        self._configured = True
+        self.api_id = self._validate_api_id(raw_api_id)
+        self.api_hash = self._validate_api_hash(raw_api_hash)
 
         # 频道配置（带验证）
         self.channels = self._validate_channels(config.get("channels", []))
@@ -234,6 +262,22 @@ class TelegramSummaryPlugin(Star):
         self.message_templates = config.get("message_templates", {})
         logger.info(f"已加载消息模板配置: {len(self.message_templates)} 项")
 
+    @staticmethod
+    def _is_empty_value(value) -> bool:
+        """检查配置值是否为空（None 或空字符串）
+
+        Args:
+            value: 配置值
+
+        Returns:
+            bool: 是否为空值
+        """
+        if value is None:
+            return True
+        if isinstance(value, str) and not value.strip():
+            return True
+        return False
+
     def _validate_api_id(self, api_id) -> int:
         """验证 Telegram API ID
 
@@ -246,7 +290,7 @@ class TelegramSummaryPlugin(Star):
         Raises:
             ValueError: 当 API ID 无效时
         """
-        if api_id is None or (isinstance(api_id, str) and not api_id.strip()):
+        if self._is_empty_value(api_id):
             raise ValueError(
                 "Telegram API ID 未配置。\n"
                 "请在插件配置中设置 'telegram.api_id'。\n"
@@ -277,7 +321,7 @@ class TelegramSummaryPlugin(Star):
         Raises:
             ValueError: 当 API Hash 无效时
         """
-        if api_hash is None or (isinstance(api_hash, str) and not api_hash.strip()):
+        if self._is_empty_value(api_hash):
             raise ValueError(
                 "Telegram API Hash 未配置。\n"
                 "请在插件配置中设置 'telegram.api_hash'。\n"
@@ -1391,6 +1435,14 @@ class TelegramSummaryPlugin(Star):
     @filter.command("summary")
     async def handle_manual_summary(self, event: AstrMessageEvent):
         """立即生成本周频道消息总结"""
+        if not self._configured:
+            yield event.plain_result(
+                "⚠️ **插件尚未配置**\n\n"
+                "请先在插件配置中填写 Telegram API ID 和 API Hash。\n"
+                "获取方式：访问 https://my.telegram.org/apps"
+            )
+            return
+
         sender_id = event.get_sender_id()
         command = event.message_str
         logger.info(f"收到命令: {command}，发送者: {sender_id}")
@@ -1700,6 +1752,14 @@ class TelegramSummaryPlugin(Star):
 
         使用状态机模式实现多步交互。
         """
+        if not self._configured:
+            yield event.plain_result(
+                "⚠️ **插件尚未配置**\n\n"
+                "请先在插件配置中填写 Telegram API ID 和 API Hash。\n"
+                "获取方式：访问 https://my.telegram.org/apps"
+            )
+            return
+
         from astrbot.core.utils.session_waiter import SessionController, session_waiter
 
         sender_id = event.get_sender_id()
