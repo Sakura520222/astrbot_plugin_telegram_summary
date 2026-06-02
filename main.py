@@ -21,7 +21,7 @@ from astrbot.api.star import Context, Star, StarTools, register
     "telegram_summary",
     "Sakura520222",
     "一个 Telegram 频道消息总结插件，每周自动生成指定频道的消息汇总报告，支持自动推送到QQ群组和用户。",
-    "1.2.2",
+    "2.0.0",
     "https://github.com/Sakura520222/astrbot_plugin_telegram_summary",
 )
 class TelegramSummaryPlugin(Star):

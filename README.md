@@ -1,6 +1,6 @@
 # Telegram 频道消息总结插件
 
-> **当前版本：v1.2.0** | [更新日志](CHANGELOG.md)
+> **当前版本：v2.0.0** | [更新日志](CHANGELOG.md)
 
 本插件转自我的另一个项目：[Sakura-Channel-Summary-Assistant](https://github.com/Sakura520222/Sakura-Channel-Summary-Assistant)
 
@@ -140,8 +140,6 @@ Bot: ✅ **登录成功！**
 ## 依赖
 
 - telethon: Telegram API 客户端库
-- python-dotenv: 环境变量加载库
-- openai: OpenAI API 客户端库
 - apscheduler: 任务调度库
 
 ## 登录说明
