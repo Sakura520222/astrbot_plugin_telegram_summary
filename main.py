@@ -186,11 +186,11 @@ class TelegramSummaryPlugin(Star):
     def _load_configurations(self, config: AstrBotConfig):
         """从配置系统加载所有配置
 
+        任何配置缺失或格式错误都不会导致插件加载失败，
+        而是将插件置于未配置状态，等待用户补全配置后重启。
+
         Args:
             config: AstrBot 配置对象
-
-        Raises:
-            ValueError: 当配置验证失败时（配置已填写但格式不正确）
         """
         logger.info("开始从 AstrBot 配置系统加载配置...")
 
@@ -206,61 +206,59 @@ class TelegramSummaryPlugin(Star):
         self.auto_push_users = []
         self.message_templates = {}
 
-        # 检查 Telegram 必需配置是否已填写
-        telegram_config = config.get("telegram", {})
-        raw_api_id = telegram_config.get("api_id")
-        raw_api_hash = telegram_config.get("api_hash")
+        try:
+            # Telegram 配置（带验证）
+            telegram_config = config.get("telegram", {})
+            self.api_id = self._validate_api_id(telegram_config.get("api_id"))
+            self.api_hash = self._validate_api_hash(telegram_config.get("api_hash"))
 
-        if self._is_empty_value(raw_api_id) or self._is_empty_value(raw_api_hash):
+            # 频道配置（带验证）
+            self.channels = self._validate_channels(config.get("channels", []))
+            logger.info(f"已加载频道列表: {self.channels}")
+
+            # 提示词配置
+            self.current_prompt = config.get("prompt", self.DEFAULT_PROMPT)
+            logger.info("已加载提示词配置")
+
+            # AI 提供商配置（带验证）
+            self.ai_provider = self._validate_ai_provider(config.get("select_provider"))
+            logger.info(f"已加载AI提供商: {self.ai_provider}")
+
+            # 自动总结时间配置（带验证）
+            self.auto_summary_time = self._validate_summary_time(
+                config.get("auto_summary_time", self.DEFAULT_AUTO_SUMMARY_TIME)
+            )
+            logger.info(f"已加载自动总结时间: {self.auto_summary_time}")
+
+            # 管理员配置（用于告警）
+            self.admin_id = config.get("admin_id")
+            if self.admin_id:
+                logger.info(f"已配置管理员ID: {self.admin_id}")
+
+            # 自动推送目标配置
+            self.auto_push_groups = config.get("auto_push_groups", [])
+            self.auto_push_users = config.get("auto_push_users", [])
+
+            # 验证推送目标格式
+            self._validate_push_targets()
+
+            logger.info(
+                f"已加载推送目标: 群组 {len(self.auto_push_groups)} 个, 用户 {len(self.auto_push_users)} 个"
+            )
+
+            # 消息模板配置
+            self.message_templates = config.get("message_templates", {})
+            logger.info(f"已加载消息模板配置: {len(self.message_templates)} 项")
+
+            self._configured = True
+            logger.info("插件配置加载完成")
+
+        except ValueError as e:
             self._configured = False
             logger.warning(
-                "Telegram API 配置未完成，插件将以未配置状态加载。\n"
-                "请在插件配置中设置 'telegram.api_id' 和 'telegram.api_hash'。\n"
-                "获取方式：访问 https://my.telegram.org/apps"
+                f"插件配置不完整，将以未配置状态加载：{e}\n"
+                "请补全配置后重启插件。"
             )
-            return
-
-        self._configured = True
-        self.api_id = self._validate_api_id(raw_api_id)
-        self.api_hash = self._validate_api_hash(raw_api_hash)
-
-        # 频道配置（带验证）
-        self.channels = self._validate_channels(config.get("channels", []))
-        logger.info(f"已加载频道列表: {self.channels}")
-
-        # 提示词配置
-        self.current_prompt = config.get("prompt", self.DEFAULT_PROMPT)
-        logger.info("已加载提示词配置")
-
-        # AI 提供商配置（带验证）
-        self.ai_provider = self._validate_ai_provider(config.get("select_provider"))
-        logger.info(f"已加载AI提供商: {self.ai_provider}")
-
-        # 自动总结时间配置（带验证）
-        self.auto_summary_time = self._validate_summary_time(
-            config.get("auto_summary_time", self.DEFAULT_AUTO_SUMMARY_TIME)
-        )
-        logger.info(f"已加载自动总结时间: {self.auto_summary_time}")
-
-        # 管理员配置（用于告警）
-        self.admin_id = config.get("admin_id")
-        if self.admin_id:
-            logger.info(f"已配置管理员ID: {self.admin_id}")
-
-        # 自动推送目标配置
-        self.auto_push_groups = config.get("auto_push_groups", [])
-        self.auto_push_users = config.get("auto_push_users", [])
-
-        # 验证推送目标格式
-        self._validate_push_targets()
-
-        logger.info(
-            f"已加载推送目标: 群组 {len(self.auto_push_groups)} 个, 用户 {len(self.auto_push_users)} 个"
-        )
-
-        # 消息模板配置
-        self.message_templates = config.get("message_templates", {})
-        logger.info(f"已加载消息模板配置: {len(self.message_templates)} 项")
 
     @staticmethod
     def _is_empty_value(value) -> bool:
