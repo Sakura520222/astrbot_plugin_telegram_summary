@@ -1513,7 +1513,7 @@ class TelegramSummaryPlugin(Star):
                 summary = await self.analyze_with_ai(messages)
                 # 获取频道名称用于报告标题
                 channel_name = channel.split("/")[-1]
-                yield event.plain_result(f"✈️ {channel_name} 频道周报总结\n\n{summary}")
+                yield event.plain_result(f"{channel_name} 频道周报总结\n\n{summary}")
 
                 # 更新该频道的上次总结时间
                 current_utc_time = datetime.now(timezone.utc)
