@@ -216,3 +216,4 @@ data/plugin_data/astrbot_plugin_telegram_summary/
 Astrbot插件开发文档.md
 .trae/
 AstrBot插件开发文档 .md
+run_ruff.py
